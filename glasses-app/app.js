@@ -242,7 +242,13 @@
       screens[screenId].classList.remove('hidden');
       state.currentScreen = screenId;
       onScreenEnter(screenId);
-      focusFirst(screens[screenId]);
+      // Reader starts in "reading mode" with no toolbar focus so ←/→ go
+      // straight to page-turning. User presses ↑ to reveal the back button.
+      if (screenId === 'reader') {
+        if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+      } else {
+        focusFirst(screens[screenId]);
+      }
     }
   }
 
@@ -322,11 +328,31 @@
     var container = screens[state.currentScreen];
     if (!container) return;
 
-    // Reader: ←/→ turn pages, ↑/↓ open/close menu (when menu is closed).
+    // ----- Reader navigation -----
+    // Reading mode (no toolbar focus): ←/→ turn pages, ↑ enters toolbar, ↓ opens menu.
+    // Toolbar mode (back or menu button focused): ←/→ moves between toolbar
+    //   buttons, ↓ exits back to reading mode, ↑ stays put.
     if (state.currentScreen === 'reader' && isReaderMenuClosed()) {
+      var rActive = document.activeElement;
+      var toolbar = document.querySelector('#reader .reader-toolbar');
+      var inToolbar = rActive && rActive.closest && rActive.closest('.reader-toolbar');
+      if (inToolbar) {
+        if (direction === 'down') { rActive.blur(); return; }
+        if (direction === 'up')   { return; }
+        var btns = visibleFocusables(toolbar);
+        var ti = btns.indexOf(rActive);
+        if (direction === 'left')  { if (ti > 0) btns[ti - 1].focus(); return; }
+        if (direction === 'right') { if (ti < btns.length - 1) btns[ti + 1].focus(); return; }
+      }
+      // Reading mode
       if (direction === 'left')  { pageBack();    return; }
       if (direction === 'right') { pageForward(); return; }
-      if (direction === 'up' || direction === 'down') { openReaderMenu(); return; }
+      if (direction === 'up') {
+        var first = toolbar && toolbar.querySelector('.focusable');
+        if (first) first.focus();
+        return;
+      }
+      if (direction === 'down') { openReaderMenu(); return; }
     }
 
     // When reader menu is open, scope focus to inside the menu.
