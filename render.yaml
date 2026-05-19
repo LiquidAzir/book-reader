@@ -1,0 +1,54 @@
+# Render Blueprint for Book Reader.
+# Provisions: static site (frontend) + web service (API) + managed Postgres.
+# Apply by pushing this file to a connected Git repo and running
+# "Blueprint → New Blueprint Instance" in the Render dashboard.
+
+databases:
+  - name: book-reader-db
+    plan: free
+    databaseName: book_reader
+    user: book_reader
+
+services:
+  # ---- Backend API ----
+  - type: web
+    name: book-reader-api
+    runtime: node
+    plan: free
+    rootDir: server
+    buildCommand: npm install && node src/migrate.js
+    startCommand: node src/index.js
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: DATABASE_URL
+        fromDatabase:
+          name: book-reader-db
+          property: connectionString
+      - key: CORS_ORIGINS
+        # After first deploy of the static site, set this to its exact URL.
+        # Leave as "*" while iterating to avoid CORS pain.
+        value: "*"
+      - key: BOOK_CACHE_MAX_ENTRIES
+        value: "50"
+
+  # ---- Frontend (static) ----
+  - type: web
+    name: book-reader-glasses
+    runtime: static
+    plan: free
+    rootDir: glasses-app
+    buildCommand: ""
+    staticPublishPath: .
+    headers:
+      - path: /*
+        name: X-Frame-Options
+        value: SAMEORIGIN
+      - path: /*
+        name: Referrer-Policy
+        value: strict-origin-when-cross-origin
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html

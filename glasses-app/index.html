@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=600, height=600, initial-scale=1.0, user-scalable=no">
+  <title>Book Reader</title>
+  <link rel="icon" type="image/png" href="favicon.png">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app">
+
+    <!-- ============ HOME ============ -->
+    <div id="home" class="screen">
+      <header class="header">
+        <h1>Book Reader</h1>
+        <span class="header-meta" id="home-status"></span>
+      </header>
+      <div class="content">
+        <div id="continue-reading-card" class="continue-card hidden">
+          <div class="continue-label">Continue reading</div>
+          <div class="continue-title" id="continue-title"></div>
+          <div class="continue-author" id="continue-author"></div>
+          <div class="progress-bar"><div class="progress-fill" id="continue-progress"></div></div>
+          <button class="nav-item primary focusable" data-action="resume-reading">Resume</button>
+        </div>
+      </div>
+      <nav class="nav-bar nav-bar-grid">
+        <button class="nav-item focusable" data-action="go-browse">Browse</button>
+        <button class="nav-item focusable" data-action="go-search">Search</button>
+        <button class="nav-item focusable" data-action="go-library">Library</button>
+        <button class="nav-item focusable" data-action="go-settings">Settings</button>
+      </nav>
+    </div>
+
+    <!-- ============ BROWSE ============ -->
+    <div id="browse" class="screen hidden">
+      <header class="header">
+        <button class="back-btn focusable" data-action="back">&#8592;</button>
+        <h1>Browse</h1>
+      </header>
+      <div class="tab-bar" id="browse-tabs">
+        <button class="tab-item focusable active" data-action="browse-tab" data-tab="popular">Popular</button>
+        <button class="tab-item focusable" data-action="browse-tab" data-tab="fiction">Fiction</button>
+        <button class="tab-item focusable" data-action="browse-tab" data-tab="adventure">Adventure</button>
+        <button class="tab-item focusable" data-action="browse-tab" data-tab="mystery">Mystery</button>
+      </div>
+      <div class="content">
+        <div id="browse-list" class="list-container"></div>
+      </div>
+    </div>
+
+    <!-- ============ SEARCH ============ -->
+    <div id="search" class="screen hidden">
+      <header class="header">
+        <button class="back-btn focusable" data-action="back">&#8592;</button>
+        <h1>Search</h1>
+      </header>
+      <div class="content">
+        <input
+          id="search-input"
+          class="text-input focusable"
+          type="text"
+          placeholder="Title or author..."
+          data-submit-action="run-search"
+          autocomplete="off"
+        />
+        <button class="nav-item primary focusable" data-action="run-search">Search</button>
+        <div id="search-results" class="list-container"></div>
+      </div>
+    </div>
+
+    <!-- ============ BOOK DETAIL ============ -->
+    <div id="book-detail" class="screen hidden">
+      <header class="header">
+        <button class="back-btn focusable" data-action="back">&#8592;</button>
+        <h1 id="detail-title">Book</h1>
+      </header>
+      <div class="content">
+        <div class="detail-meta">
+          <div class="detail-author" id="detail-author"></div>
+          <div class="detail-subjects" id="detail-subjects"></div>
+        </div>
+        <div class="detail-actions">
+          <button class="nav-item primary focusable" data-action="open-book">Read</button>
+          <button class="nav-item focusable" data-action="toggle-favorite" id="detail-favorite-btn">Favorite</button>
+        </div>
+        <div class="detail-description" id="detail-description"></div>
+      </div>
+    </div>
+
+    <!-- ============ READER ============ -->
+    <div id="reader" class="screen hidden">
+      <div class="reader-toolbar" id="reader-toolbar">
+        <button class="back-btn focusable" data-action="back">&#8592;</button>
+        <div class="reader-toolbar-title" id="reader-toolbar-title"></div>
+        <button class="reader-toolbar-btn focusable" data-action="open-reader-menu">&#9776;</button>
+      </div>
+      <div class="reader-page" id="reader-page">
+        <div class="reader-page-inner" id="reader-page-inner"></div>
+      </div>
+      <div class="reader-footer" id="reader-footer">
+        <span id="reader-page-num">—</span>
+      </div>
+
+      <div class="reader-menu hidden focusable" id="reader-menu" tabindex="-1">
+        <div class="reader-menu-row">
+          <span class="reader-menu-label">Text size</span>
+          <div class="reader-menu-controls">
+            <button class="reader-menu-btn focusable" data-action="text-size-down">A-</button>
+            <span id="text-size-display" class="reader-menu-value">M</span>
+            <button class="reader-menu-btn focusable" data-action="text-size-up">A+</button>
+          </div>
+        </div>
+        <button class="nav-item focusable" data-action="close-reader-menu">Close</button>
+      </div>
+    </div>
+
+    <!-- ============ LIBRARY ============ -->
+    <div id="library" class="screen hidden">
+      <header class="header">
+        <button class="back-btn focusable" data-action="back">&#8592;</button>
+        <h1>My Library</h1>
+      </header>
+      <div class="tab-bar">
+        <button class="tab-item focusable active" data-action="library-tab" data-tab="favorites">Favorites</button>
+        <button class="tab-item focusable" data-action="library-tab" data-tab="recents">Recents</button>
+      </div>
+      <div class="content">
+        <div id="library-list" class="list-container"></div>
+      </div>
+    </div>
+
+    <!-- ============ SETTINGS ============ -->
+    <div id="settings" class="screen hidden">
+      <header class="header">
+        <button class="back-btn focusable" data-action="back">&#8592;</button>
+        <h1>Settings</h1>
+      </header>
+      <div class="content">
+        <div class="settings-row">
+          <span class="settings-label">Text size</span>
+          <div class="settings-controls">
+            <button class="reader-menu-btn focusable" data-action="text-size-down">A-</button>
+            <span id="settings-size-display" class="reader-menu-value">M</span>
+            <button class="reader-menu-btn focusable" data-action="text-size-up">A+</button>
+          </div>
+        </div>
+        <div class="settings-row">
+          <span class="settings-label">Line spacing</span>
+          <div class="settings-controls">
+            <button class="reader-menu-btn focusable" data-action="line-spacing-down">−</button>
+            <span id="settings-spacing-display" class="reader-menu-value">1.5</span>
+            <button class="reader-menu-btn focusable" data-action="line-spacing-up">+</button>
+          </div>
+        </div>
+        <div class="settings-meta">
+          <div class="settings-meta-label">Device ID</div>
+          <div class="settings-meta-value" id="settings-device-id">—</div>
+        </div>
+        <div class="settings-meta">
+          <div class="settings-meta-label">Server</div>
+          <div class="settings-meta-value" id="settings-server-status">—</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Toast container is created dynamically -->
+  </div>
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
