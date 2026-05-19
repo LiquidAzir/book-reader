@@ -51,6 +51,7 @@
     browseTab: 'popular',
     libraryTab: 'favorites',
     detailBook: null,
+    browseExtras: {},      // per-tab pagination: { tab: { gutendexPage, hasMore, loadingMore, loadedIds: Set, generation } }
   };
 
   var screens = {};
@@ -420,6 +421,22 @@
     toast._t = setTimeout(function () { toast.classList.remove('visible'); }, 2200);
   }
 
+  function bookListItem(b) {
+    var btn = document.createElement('button');
+    btn.className = 'book-item focusable';
+    btn.dataset.action = 'open-detail';
+    btn.dataset.bookId = String(b.id);
+    btn.dataset.bookTitle = b.title || '';
+    btn.dataset.bookAuthor = b.author || '';
+    btn.innerHTML =
+      '<div class="book-item-title">' + escapeHtml(b.title || 'Untitled') + '</div>' +
+      '<div class="book-item-author">' + escapeHtml(b.author || 'Unknown') + '</div>' +
+      (b.metaLine
+        ? '<div class="book-item-meta">' + escapeHtml(b.metaLine) + '</div>'
+        : '');
+    return btn;
+  }
+
   function renderBookList(containerId, books, opts) {
     opts = opts || {};
     var container = document.getElementById(containerId);
@@ -430,21 +447,16 @@
       container.innerHTML = '<div class="empty-row">' + escapeHtml(msg) + '</div>';
       return;
     }
-    books.forEach(function (b) {
-      var btn = document.createElement('button');
-      btn.className = 'book-item focusable';
-      btn.dataset.action = 'open-detail';
-      btn.dataset.bookId = String(b.id);
-      btn.dataset.bookTitle = b.title || '';
-      btn.dataset.bookAuthor = b.author || '';
-      btn.innerHTML =
-        '<div class="book-item-title">' + escapeHtml(b.title || 'Untitled') + '</div>' +
-        '<div class="book-item-author">' + escapeHtml(b.author || 'Unknown') + '</div>' +
-        (b.metaLine
-          ? '<div class="book-item-meta">' + escapeHtml(b.metaLine) + '</div>'
-          : '');
-      container.appendChild(btn);
-    });
+    books.forEach(function (b) { container.appendChild(bookListItem(b)); });
+  }
+
+  function appendBooksToList(containerId, books) {
+    var container = document.getElementById(containerId);
+    if (!container || !books || !books.length) return;
+    // Strip empty-state row if present
+    var empty = container.querySelector('.empty-row');
+    if (empty) empty.remove();
+    books.forEach(function (b) { container.appendChild(bookListItem(b)); });
   }
 
   function escapeHtml(s) {
@@ -510,36 +522,50 @@
     var list = document.getElementById('browse-list');
     var fallback = window.__BOOK_READER_FALLBACK_CATALOG__;
 
+    // Reset pagination state for this tab. generation lets us ignore stale
+    // Load-More responses if the user switches tabs mid-fetch.
+    var gen = ((state.browseExtras[tab] && state.browseExtras[tab].generation) || 0) + 1;
+    state.browseExtras[tab] = {
+      gutendexPage: 0, hasMore: true, loadingMore: false,
+      loadedIds: Object.create(null), generation: gen,
+    };
+
     if (tab !== 'popular') {
-      // Topic tabs always render from the bundled catalog — instant, no spinner.
+      // Topic tabs render bundled list instantly. Load More augments with Gutendex.
       var entries = fallback ? fallback.forTab(tab) : [];
-      renderBookList('browse-list', entries.map(function (b) {
+      var bundledBooks = entries.map(function (b) {
         return {
           id: b.id, title: b.title, author: b.author, subjects: b.subjects,
           metaLine: b.subjects.slice(0, 2).join(' • '),
         };
-      }), { emptyMessage: 'No books in this category yet' });
+      });
+      bundledBooks.forEach(function (b) { state.browseExtras[tab].loadedIds[b.id] = true; });
+      renderBookList('browse-list', bundledBooks, { emptyMessage: 'No books in this category yet' });
+      updateLoadMoreButton();
       return;
     }
 
-    // Popular tab → live Gutendex via our backend.
+    // Popular tab → live Gutendex page 1.
     list.innerHTML = '<div class="loading-row">Loading…</div>';
-    var params = { sort: 'popular', page: 1 };
     var cacheKey = 'browse:popular';
     var cached = state.cache[cacheKey];
     if (cached && Date.now() - cached.timestamp < CONFIG.cacheDuration) {
-      renderBrowseResults(cached.data);
+      renderPopularInitial(cached.data);
       return;
     }
-    fetchBookList(params).then(function (data) {
+    fetchBookList({ sort: 'popular', page: 1 }).then(function (data) {
       state.cache[cacheKey] = { data: data, timestamp: Date.now() };
-      renderBrowseResults(data);
+      renderPopularInitial(data);
     }).catch(function (err) {
       console.warn('[browse] catalog API failed, using fallback catalog:', err.message);
       if (fallback) {
-        renderBookList('browse-list', fallback.forTab('popular').map(function (b) {
+        var fb = fallback.forTab('popular').map(function (b) {
           return { id: b.id, title: b.title, author: b.author, metaLine: 'Offline catalog' };
-        }), { emptyMessage: 'No books found' });
+        });
+        fb.forEach(function (b) { state.browseExtras.popular.loadedIds[b.id] = true; });
+        state.browseExtras.popular.hasMore = false;
+        renderBookList('browse-list', fb, { emptyMessage: 'No books found' });
+        updateLoadMoreButton();
       } else {
         list.innerHTML =
           '<div class="error-row">Couldn’t load: ' + escapeHtml(err.message || 'network error') + '</div>' +
@@ -547,12 +573,77 @@
       }
     });
   }
-  function renderBrowseResults(data) {
+  function renderPopularInitial(data) {
     var books = (data.results || []).map(normalizeGutendexBook).map(function (b) {
       b.metaLine = b.downloadCount ? (b.downloadCount.toLocaleString() + ' downloads') : '';
       return b;
     });
+    var ex = state.browseExtras.popular;
+    books.forEach(function (b) { ex.loadedIds[b.id] = true; });
+    ex.gutendexPage = 1;
+    ex.hasMore = !!data.next;
     renderBookList('browse-list', books, { emptyMessage: 'No books in this category' });
+    updateLoadMoreButton();
+  }
+
+  function updateLoadMoreButton(errorMsg) {
+    var el = document.getElementById('browse-load-more');
+    if (!el) return;
+    var tab = state.browseTab;
+    var ex = state.browseExtras[tab];
+    if (!ex) { el.innerHTML = ''; return; }
+    if (ex.loadingMore) {
+      el.innerHTML = '<div class="loading-row">Loading more…</div>';
+      return;
+    }
+    if (errorMsg) {
+      el.innerHTML =
+        '<div class="error-row">' + escapeHtml(errorMsg) + '</div>' +
+        '<button class="nav-item focusable" data-action="load-more-books">Try again</button>';
+      return;
+    }
+    if (!ex.hasMore) { el.innerHTML = ''; return; }
+    var label = tab === 'popular' ? 'Load more' : 'Load more from Gutenberg';
+    el.innerHTML = '<button class="nav-item focusable" data-action="load-more-books">' + label + '</button>';
+  }
+
+  function loadMoreBooks() {
+    var tab = state.browseTab;
+    var ex = state.browseExtras[tab];
+    if (!ex || ex.loadingMore || !ex.hasMore) return;
+    ex.loadingMore = true;
+    var gen = ex.generation;
+    updateLoadMoreButton();
+
+    var query;
+    if (tab === 'popular') {
+      query = { sort: 'popular', page: ex.gutendexPage + 1 };
+    } else {
+      // For topic tabs, use search= since Gutendex topic= is even slower.
+      query = { search: tab, sort: 'popular', page: ex.gutendexPage + 1 };
+    }
+
+    fetchBookList(query).then(function (data) {
+      // Drop if user has changed tabs in the meantime.
+      if (gen !== state.browseExtras[tab].generation || state.browseTab !== tab) return;
+      var fresh = (data.results || [])
+        .map(normalizeGutendexBook)
+        .filter(function (b) { return !ex.loadedIds[b.id]; })
+        .map(function (b) {
+          b.metaLine = b.downloadCount ? (b.downloadCount.toLocaleString() + ' downloads') : '';
+          return b;
+        });
+      fresh.forEach(function (b) { ex.loadedIds[b.id] = true; });
+      appendBooksToList('browse-list', fresh);
+      ex.gutendexPage += 1;
+      ex.hasMore = !!data.next;
+      ex.loadingMore = false;
+      updateLoadMoreButton();
+    }).catch(function (err) {
+      if (gen !== state.browseExtras[tab].generation || state.browseTab !== tab) return;
+      ex.loadingMore = false;
+      updateLoadMoreButton(err.message || 'Network error');
+    });
   }
 
   // ---- Search ----
@@ -983,6 +1074,7 @@
       case 'go-settings':       navigateTo('settings'); break;
       case 'resume-reading':    resumeReading(); break;
       case 'browse-tab':        loadBrowse(el.dataset.tab); break;
+      case 'load-more-books':   loadMoreBooks(); break;
       case 'library-tab':       state.libraryTab = el.dataset.tab; renderLibrary(); break;
       case 'open-detail':       openBookDetailFromElement(el); break;
       case 'run-search':        runSearch(); break;

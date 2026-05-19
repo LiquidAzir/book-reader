@@ -468,6 +468,17 @@ body {
   word-break: break-all;
 }
 
+/* --- Load More --- */
+.load-more-area {
+  margin-top: 4px;
+  min-height: 1px;
+}
+.load-more-area:empty { display: none; }
+.load-more-area .nav-item {
+  width: 100%;
+  margin-top: 4px;
+}
+
 /* --- Loading / Error placeholders --- */
 .loading-row {
   padding: 20px;
