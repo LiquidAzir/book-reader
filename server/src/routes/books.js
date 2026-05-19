@@ -4,7 +4,9 @@ const router = express.Router();
 
 const GUTENDEX = 'https://gutendex.com';
 const MAX_ENTRIES = Number(process.env.BOOK_CACHE_MAX_ENTRIES || 50);
-const FETCH_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS || 8000);
+// Gutendex list queries can take 15-20s under load. Allow up to 20s before
+// we give up; the frontend uses a bundled fallback when Browse times out.
+const FETCH_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS || 20000);
 const METADATA_CACHE_TTL_MS = 1000 * 60 * 60; // 1 hour
 const LIST_CACHE_TTL_MS = 1000 * 60 * 10;     // 10 minutes
 

@@ -490,21 +490,36 @@
   }
 
   // ---- Browse ----
+  // Tabs split into two strategies:
+  //   - "popular" hits the live Gutendex catalog (fast, ~1s) so users see the
+  //     freshest most-downloaded books from the full 78K set.
+  //   - Topic tabs (fiction / adventure / mystery) render from the bundled
+  //     catalog directly. Gutendex topic-filtered queries take 15-22s which is
+  //     unusable on glasses; the curated bundled list is instant and reliable.
   function loadBrowse(tab) {
     state.browseTab = tab;
     document.querySelectorAll('#browse-tabs .tab-item').forEach(function (el) {
       el.classList.toggle('active', el.dataset.tab === tab);
     });
     var list = document.getElementById('browse-list');
-    list.innerHTML = '<div class="loading-row">Loading…</div>';
-    var params = { page: 1 };
-    if (tab === 'popular') {
-      params.sort = 'popular';
-    } else {
-      params.topic = tab;
-      params.sort = 'popular';
+    var fallback = window.__BOOK_READER_FALLBACK_CATALOG__;
+
+    if (tab !== 'popular') {
+      // Topic tabs always render from the bundled catalog — instant, no spinner.
+      var entries = fallback ? fallback.forTab(tab) : [];
+      renderBookList('browse-list', entries.map(function (b) {
+        return {
+          id: b.id, title: b.title, author: b.author, subjects: b.subjects,
+          metaLine: b.subjects.slice(0, 2).join(' • '),
+        };
+      }), { emptyMessage: 'No books in this category yet' });
+      return;
     }
-    var cacheKey = 'browse:' + tab;
+
+    // Popular tab → live Gutendex via our backend.
+    list.innerHTML = '<div class="loading-row">Loading…</div>';
+    var params = { sort: 'popular', page: 1 };
+    var cacheKey = 'browse:popular';
     var cached = state.cache[cacheKey];
     if (cached && Date.now() - cached.timestamp < CONFIG.cacheDuration) {
       renderBrowseResults(cached.data);
@@ -514,21 +529,15 @@
       state.cache[cacheKey] = { data: data, timestamp: Date.now() };
       renderBrowseResults(data);
     }).catch(function (err) {
-      // Catalog API failed — serve the bundled fallback list so Browse still works.
       console.warn('[browse] catalog API failed, using fallback catalog:', err.message);
-      var fallback = window.__BOOK_READER_FALLBACK_CATALOG__;
       if (fallback) {
-        var entries = fallback.forTab(tab).map(function (b) {
-          return { id: b.id, title: b.title, author: b.author, subjects: b.subjects, downloadCount: null, _fromFallback: true };
-        });
-        renderBookList('browse-list', entries.map(function (b) {
-          b.metaLine = 'Offline catalog';
-          return b;
+        renderBookList('browse-list', fallback.forTab('popular').map(function (b) {
+          return { id: b.id, title: b.title, author: b.author, metaLine: 'Offline catalog' };
         }), { emptyMessage: 'No books found' });
       } else {
         list.innerHTML =
           '<div class="error-row">Couldn’t load: ' + escapeHtml(err.message || 'network error') + '</div>' +
-          '<button class="nav-item primary focusable" data-action="browse-tab" data-tab="' + escapeHtml(tab) + '">Retry</button>';
+          '<button class="nav-item primary focusable" data-action="browse-tab" data-tab="popular">Retry</button>';
       }
     });
   }
