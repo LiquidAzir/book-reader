@@ -34,10 +34,10 @@ services:
         value: "50"
 
   # ---- Frontend (static) ----
+  # Note: Render static sites don't take a `plan` field — always free.
   - type: web
     name: book-reader-glasses
     runtime: static
-    plan: free
     rootDir: glasses-app
     buildCommand: ""
     staticPublishPath: .
