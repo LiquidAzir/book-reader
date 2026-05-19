@@ -136,27 +136,46 @@
           return fetch(url).then(function (r) { return r.text(); });
         });
     }
-    // Race the two retrieval paths in parallel:
+    // Race two retrieval paths in parallel:
     //   primary: /api/books/:id/content — uses backend cache, requires Gutendex up
     //   proxy:   /api/proxy?url=...     — direct gutenberg.org via our backend
-    // Whichever succeeds first wins. If only one path is viable, the other
-    // rejects fast and Promise.any uses the winning one.
-    var primary = fetch(apiUrl('/api/books/' + bookId + '/content')).then(function (res) {
+    // Hand-rolled "first-success" race instead of Promise.any so we don't
+    // depend on Chrome 85+ — the embedded Display glasses browser may be older.
+    var primaryPromise = fetch(apiUrl('/api/books/' + bookId + '/content')).then(function (res) {
       if (!res.ok) throw new Error('primary ' + res.status);
       return res.text();
     });
     var fb = window.__BOOK_READER_FALLBACK_CATALOG__;
     var entry = fb && fb.byId[bookId];
-    if (!(entry && entry.gutenbergTextUrl)) return primary;
-    var proxy = fetch(apiUrl('/api/proxy?url=' + encodeURIComponent(entry.gutenbergTextUrl)))
+    if (!(entry && entry.gutenbergTextUrl)) return primaryPromise;
+    var proxyPromise = fetch(apiUrl('/api/proxy?url=' + encodeURIComponent(entry.gutenbergTextUrl)))
       .then(function (res) {
         if (!res.ok) throw new Error('proxy ' + res.status);
         return res.text();
       });
-    return Promise.any([primary, proxy]).catch(function (errs) {
-      // AggregateError when both fail
-      var msg = (errs.errors && errs.errors[0] && errs.errors[0].message) || 'both retrieval paths failed';
-      throw new Error(msg);
+    return firstSuccess([primaryPromise, proxyPromise]);
+  }
+
+  // Resolves with the first promise that fulfills. Rejects only when all reject.
+  function firstSuccess(promises) {
+    return new Promise(function (resolve, reject) {
+      var settled = false;
+      var rejected = 0;
+      var errors = [];
+      promises.forEach(function (p, i) {
+        p.then(function (v) {
+          if (settled) return;
+          settled = true;
+          resolve(v);
+        }, function (err) {
+          errors[i] = err;
+          rejected++;
+          if (rejected === promises.length && !settled) {
+            settled = true;
+            reject(new Error(errors.map(function (e) { return e && e.message || String(e); }).join(' / ')));
+          }
+        });
+      });
     });
   }
 
@@ -636,7 +655,10 @@
       if (secs >= 3) statusEl.textContent = 'Loading book… ' + secs + 's';
     }, 1000);
 
-    fetchBookText(b.id).then(function (text) {
+    // Promise.resolve().then() converts any synchronous throw inside
+    // fetchBookText into a Promise rejection so .catch can show the error UI
+    // (e.g. if a referenced API like Promise.any didn't exist on this browser).
+    Promise.resolve().then(function () { return fetchBookText(b.id); }).then(function (text) {
       clearInterval(loadTimer);
       var cleaned = stripGutenbergBoilerplate(text);
       state.reader.text = cleaned;
