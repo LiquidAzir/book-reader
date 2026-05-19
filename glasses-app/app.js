@@ -32,7 +32,7 @@
       recents: [],          // [{ id, title, author, lastReadAt }] most-recent first, capped
       progress: {},         // bookId -> { fraction: 0..1, updatedAt }
       settings: {
-        textSizeIdx: 1,       // index into CONFIG.textSizes (M)
+        textSizeIdx: 2,       // index into CONFIG.textSizes (L) — readable default on additive display
         lineSpacingIdx: 1,    // index into CONFIG.lineSpacings (1.5)
       },
     },
@@ -126,35 +126,38 @@
   }
 
   function fetchBookText(bookId) {
-    // Primary: ask our backend (which proxies Gutendex and caches).
-    if (CONFIG.apiBaseUrl) {
-      var primary = fetch(apiUrl('/api/books/' + bookId + '/content')).then(function (res) {
-        if (!res.ok) throw new Error('HTTP ' + res.status);
+    if (!CONFIG.apiBaseUrl) {
+      // No backend: try direct (will usually CORS-fail). Kept for local-only dev.
+      return fetch(CONFIG.gutendexBaseUrl + '/books/' + bookId).then(function (r) { return r.json(); })
+        .then(function (meta) {
+          var fmts = (meta && meta.formats) || {};
+          var url = fmts['text/plain; charset=utf-8'] || fmts['text/plain'];
+          if (!url) throw new Error('No plain-text edition available');
+          return fetch(url).then(function (r) { return r.text(); });
+        });
+    }
+    // Race the two retrieval paths in parallel:
+    //   primary: /api/books/:id/content — uses backend cache, requires Gutendex up
+    //   proxy:   /api/proxy?url=...     — direct gutenberg.org via our backend
+    // Whichever succeeds first wins. If only one path is viable, the other
+    // rejects fast and Promise.any uses the winning one.
+    var primary = fetch(apiUrl('/api/books/' + bookId + '/content')).then(function (res) {
+      if (!res.ok) throw new Error('primary ' + res.status);
+      return res.text();
+    });
+    var fb = window.__BOOK_READER_FALLBACK_CATALOG__;
+    var entry = fb && fb.byId[bookId];
+    if (!(entry && entry.gutenbergTextUrl)) return primary;
+    var proxy = fetch(apiUrl('/api/proxy?url=' + encodeURIComponent(entry.gutenbergTextUrl)))
+      .then(function (res) {
+        if (!res.ok) throw new Error('proxy ' + res.status);
         return res.text();
       });
-      // If backend fails (e.g. Gutendex down so it can't resolve the .txt URL),
-      // try the bundled fallback URL via the backend's pass-through proxy.
-      var fb = window.__BOOK_READER_FALLBACK_CATALOG__;
-      var entry = fb && fb.byId[bookId];
-      if (entry && entry.gutenbergTextUrl) {
-        return primary.catch(function () {
-          return fetch(apiUrl('/api/proxy?url=' + encodeURIComponent(entry.gutenbergTextUrl)))
-            .then(function (res) {
-              if (!res.ok) throw new Error('HTTP ' + res.status);
-              return res.text();
-            });
-        });
-      }
-      return primary;
-    }
-    // No backend: try direct (will usually CORS-fail).
-    return fetch(CONFIG.gutendexBaseUrl + '/books/' + bookId).then(function (r) { return r.json(); })
-      .then(function (meta) {
-        var fmts = (meta && meta.formats) || {};
-        var url = fmts['text/plain; charset=utf-8'] || fmts['text/plain'];
-        if (!url) throw new Error('No plain-text edition available');
-        return fetch(url).then(function (r) { return r.text(); });
-      });
+    return Promise.any([primary, proxy]).catch(function (errs) {
+      // AggregateError when both fail
+      var msg = (errs.errors && errs.errors[0] && errs.errors[0].message) || 'both retrieval paths failed';
+      throw new Error(msg);
+    });
   }
 
   // ---- User data (server is source-of-truth when present) ----
@@ -230,45 +233,123 @@
     }
     if (state.screenHistory.length > 0) {
       navigateTo(state.screenHistory.pop(), { addToHistory: false });
+      return;
+    }
+    // No history: if we're already on home, re-focus its first element so the
+    // user is never stranded with no working buttons. Otherwise return home.
+    if (state.currentScreen !== 'home') {
+      navigateTo('home', { addToHistory: false });
+    } else {
+      focusFirst(screens.home);
     }
   }
 
   // ==================== FOCUS ====================
-  function focusFirst(container) {
-    var el = container.querySelector('.focusable:not([disabled]):not(.hidden)');
-    if (el) el.focus();
+  // Visible-and-enabled focusables. Filters out elements with hidden ancestors
+  // (e.g. Resume button inside a hidden Continue Reading card) since
+  // .focusable:not(.hidden) only checks the element itself.
+  function visibleFocusables(container) {
+    return Array.from(container.querySelectorAll('.focusable:not([disabled])'))
+      .filter(function (el) {
+        if (el.offsetParent === null) return false;  // hidden ancestor
+        var r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      });
   }
+
+  function focusFirst(container) {
+    var els = visibleFocusables(container);
+    if (els.length) els[0].focus();
+  }
+
+  // Spatial (2D) focus: picks the visible focusable closest to the current one
+  // in the requested direction, with a perpendicular-drift penalty so e.g.
+  // pressing Down from a tab lands on the list below rather than the next tab.
+  function moveFocusSpatial(focusables, current, direction) {
+    var cr = current.getBoundingClientRect();
+    var cx = (cr.left + cr.right) / 2;
+    var cy = (cr.top + cr.bottom) / 2;
+    var EPSILON = 4; // px hysteresis so micro-misalignments don't wrong-direct
+
+    var best = null, bestScore = Infinity;
+    for (var i = 0; i < focusables.length; i++) {
+      var el = focusables[i];
+      if (el === current) continue;
+      var r = el.getBoundingClientRect();
+      var ex = (r.left + r.right) / 2;
+      var ey = (r.top + r.bottom) / 2;
+      var dx = ex - cx, dy = ey - cy;
+
+      // Must be on the correct side of `current` for this direction.
+      if (direction === 'up'    && dy >= -EPSILON) continue;
+      if (direction === 'down'  && dy <=  EPSILON) continue;
+      if (direction === 'left'  && dx >= -EPSILON) continue;
+      if (direction === 'right' && dx <=  EPSILON) continue;
+
+      // Score: primary-axis distance + heavy perpendicular penalty.
+      var primary, perp;
+      if (direction === 'up' || direction === 'down') {
+        primary = Math.abs(dy);  perp = Math.abs(dx);
+      } else {
+        primary = Math.abs(dx);  perp = Math.abs(dy);
+      }
+      var score = primary + perp * 2.5;
+      if (score < bestScore) { bestScore = score; best = el; }
+    }
+    return best;
+  }
+
   function moveFocus(direction) {
     var container = screens[state.currentScreen];
     if (!container) return;
 
-    // Reader: ←/→ turn pages, ↑/↓ open/close menu
+    // Reader: ←/→ turn pages, ↑/↓ open/close menu (when menu is closed).
     if (state.currentScreen === 'reader' && isReaderMenuClosed()) {
       if (direction === 'left')  { pageBack();    return; }
       if (direction === 'right') { pageForward(); return; }
       if (direction === 'up' || direction === 'down') { openReaderMenu(); return; }
     }
 
-    var focusables = Array.from(
-      container.querySelectorAll('.focusable:not([disabled]):not(.hidden)')
-    );
-    // If reader menu is open, restrict focus to within it
+    // When reader menu is open, scope focus to inside the menu.
     if (state.currentScreen === 'reader' && !isReaderMenuClosed()) {
       var menu = document.getElementById('reader-menu');
-      focusables = Array.from(menu.querySelectorAll('.focusable:not([disabled])'));
+      var menuFocusables = visibleFocusables(menu);
+      if (!menuFocusables.length) return;
+      var menuCurrent = document.activeElement;
+      if (!menuFocusables.includes(menuCurrent)) { menuFocusables[0].focus(); return; }
+      var menuNext = moveFocusSpatial(menuFocusables, menuCurrent, direction);
+      if (menuNext) menuNext.focus();
+      return;
     }
+
+    var focusables = visibleFocusables(container);
     if (focusables.length === 0) return;
+
     var current = document.activeElement;
-    var idx = focusables.indexOf(current);
-    if (idx === -1) { focusables[0].focus(); return; }
-    var nextIdx;
-    if (direction === 'up' || direction === 'left') {
-      nextIdx = idx > 0 ? idx - 1 : focusables.length - 1;
-    } else {
-      nextIdx = idx < focusables.length - 1 ? idx + 1 : 0;
+    if (!focusables.includes(current)) {
+      focusables[0].focus();
+      return;
     }
-    focusables[nextIdx].focus();
-    focusables[nextIdx].scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+
+    var next = moveFocusSpatial(focusables, current, direction);
+    if (!next) {
+      // No element in that direction. For up/down, wrap to first/last in primary axis.
+      // For left/right, just stay put (no surprising wrap mid-row).
+      if (direction === 'down') next = focusables[0];
+      else if (direction === 'up') next = focusables[focusables.length - 1];
+    }
+    // When entering a tab row (up from list, or down from header), snap to the
+    // currently-active tab rather than whichever is horizontally closest —
+    // matches the user's mental model of "the tab they're on".
+    if (next && next.classList.contains('tab-item') && !next.classList.contains('active')) {
+      var tabBar = next.closest('.tab-bar');
+      var active = tabBar && tabBar.querySelector('.tab-item.active');
+      if (active && focusables.includes(active)) next = active;
+    }
+    if (next) {
+      next.focus();
+      next.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
   }
 
   // ==================== UI HELPERS ====================
@@ -538,14 +619,25 @@
       (state.data.progress[b.id] && state.data.progress[b.id].fraction) || 0;
 
     document.getElementById('reader-toolbar-title').textContent = b.title;
-    document.getElementById('reader-page-inner').innerHTML =
-      '<div class="loading-row">Loading book…</div>';
+    var inner = document.getElementById('reader-page-inner');
+    inner.innerHTML = '<div class="loading-row" id="reader-load-status">Loading book…</div>';
     document.getElementById('reader-page-num').textContent = '—';
 
     navigateTo('reader');
     applyTextSize();
 
+    // Surface elapsed time during long loads so the user isn't staring at a
+    // dead-looking "Loading…" string while we fight Gutendex.
+    var loadStart = Date.now();
+    var loadTimer = setInterval(function () {
+      var statusEl = document.getElementById('reader-load-status');
+      if (!statusEl) return clearInterval(loadTimer);
+      var secs = Math.floor((Date.now() - loadStart) / 1000);
+      if (secs >= 3) statusEl.textContent = 'Loading book… ' + secs + 's';
+    }, 1000);
+
     fetchBookText(b.id).then(function (text) {
+      clearInterval(loadTimer);
       var cleaned = stripGutenbergBoilerplate(text);
       state.reader.text = cleaned;
       rebuildPages();
@@ -553,8 +645,13 @@
       seekToFraction(resume);
       addToRecents();
     }).catch(function (err) {
+      clearInterval(loadTimer);
       document.getElementById('reader-page-inner').innerHTML =
-        '<div class="error-row">Couldn’t load book. ' + escapeHtml(err.message || '') + '</div>';
+        '<div class="error-row">Couldn’t load book.<br>' +
+        escapeHtml(err.message || '') +
+        '</div>' +
+        '<button class="nav-item primary focusable" data-action="retry-open-book" style="margin-top:16px">Retry</button>';
+      focusFirst(screens.reader);
     });
   }
 
@@ -827,6 +924,7 @@
       case 'open-detail':       openBookDetailFromElement(el); break;
       case 'run-search':        runSearch(); break;
       case 'open-book':         openBook(); break;
+      case 'retry-open-book':   openBook(); break;
       case 'toggle-favorite':   toggleFavorite(); break;
       case 'open-reader-menu':  openReaderMenu(); break;
       case 'close-reader-menu': closeReaderMenu(); break;
