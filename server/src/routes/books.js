@@ -1,92 +1,126 @@
 const express = require('express');
-const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
 
 const router = express.Router();
 
 const GUTENDEX = 'https://gutendex.com';
 const MAX_ENTRIES = Number(process.env.BOOK_CACHE_MAX_ENTRIES || 50);
+const FETCH_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS || 8000);
+const METADATA_CACHE_TTL_MS = 1000 * 60 * 60; // 1 hour
+const LIST_CACHE_TTL_MS = 1000 * 60 * 10;     // 10 minutes
 
-// Simple LRU for fetched book text. Render free tier has limited memory, so we
-// cap entries and evict oldest. Each entry is the cleaned plain-text body.
-const textCache = new Map(); // bookId -> { text, fetchedAt }
-function cacheGet(id) {
-  if (!textCache.has(id)) return null;
-  const v = textCache.get(id);
-  textCache.delete(id);
-  textCache.set(id, v); // bump to most-recent
-  return v.text;
-}
-function cacheSet(id, text) {
-  textCache.set(id, { text, fetchedAt: Date.now() });
-  while (textCache.size > MAX_ENTRIES) {
-    const oldest = textCache.keys().next().value;
-    textCache.delete(oldest);
+// Aborts the upstream fetch after FETCH_TIMEOUT_MS so a slow/down Gutendex
+// can't pin a request handler indefinitely.
+async function fetchWithTimeout(url, opts = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), opts.timeoutMs || FETCH_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...opts, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
   }
 }
 
-// Proxy Gutendex search/browse to keep the frontend free of CORS and to let us
-// add caching/rate-limiting later without a redeploy.
-router.get('/books', async (req, res) => {
+// LRU cache for full book text (large). Keyed by bookId.
+const textCache = new Map();
+function lruGet(map, key) {
+  if (!map.has(key)) return null;
+  const v = map.get(key);
+  map.delete(key);
+  map.set(key, v);
+  return v;
+}
+function lruSet(map, key, value, cap) {
+  map.set(key, value);
+  while (map.size > cap) map.delete(map.keys().next().value);
+}
+
+// In-memory cache for Gutendex JSON responses (list + detail). When Gutendex
+// is down, we can serve stale entries so Browse still shows something.
+const jsonCache = new Map(); // key -> { data, fetchedAt }
+async function cachedJson(key, url, ttl) {
+  const hit = lruGet(jsonCache, key);
+  if (hit && Date.now() - hit.fetchedAt < ttl) {
+    return { data: hit.data, fresh: true };
+  }
   try {
-    const qs = new URLSearchParams(req.query).toString();
-    const r = await fetch(GUTENDEX + '/books?' + qs);
-    if (!r.ok) return res.status(r.status).json({ error: 'Gutendex error' });
+    const r = await fetchWithTimeout(url);
+    if (!r.ok) throw new Error('upstream ' + r.status);
     const data = await r.json();
-    res.set('Cache-Control', 'public, max-age=300');
+    lruSet(jsonCache, key, { data, fetchedAt: Date.now() }, 200);
+    return { data, fresh: true };
+  } catch (err) {
+    if (hit) return { data: hit.data, fresh: false, error: err.message };
+    throw err;
+  }
+}
+
+// Proxy Gutendex search/browse with server-side caching + timeout so a slow
+// upstream doesn't translate to slow Browse.
+router.get('/books', async (req, res) => {
+  const qs = new URLSearchParams(req.query).toString();
+  const key = 'list:' + qs;
+  try {
+    const { data, fresh } = await cachedJson(key, GUTENDEX + '/books?' + qs, LIST_CACHE_TTL_MS);
+    res.set('Cache-Control', fresh ? 'public, max-age=300' : 'public, max-age=60');
+    if (!fresh) res.set('X-Cache-Status', 'stale');
     res.json(data);
   } catch (err) {
     console.error('[books] list failed:', err.message);
-    res.status(502).json({ error: 'Upstream fetch failed' });
+    res.status(503).json({ error: 'Catalog temporarily unavailable. Try again in a moment.' });
   }
 });
 
 router.get('/books/:id', async (req, res) => {
   const id = String(req.params.id);
   try {
-    const r = await fetch(GUTENDEX + '/books/' + encodeURIComponent(id));
-    if (!r.ok) return res.status(r.status).json({ error: 'Gutendex error' });
-    const data = await r.json();
-    res.set('Cache-Control', 'public, max-age=3600');
+    const { data, fresh } = await cachedJson(
+      'detail:' + id,
+      GUTENDEX + '/books/' + encodeURIComponent(id),
+      METADATA_CACHE_TTL_MS
+    );
+    res.set('Cache-Control', fresh ? 'public, max-age=3600' : 'public, max-age=300');
+    if (!fresh) res.set('X-Cache-Status', 'stale');
     res.json(data);
   } catch (err) {
     console.error('[books] detail failed:', err.message);
-    res.status(502).json({ error: 'Upstream fetch failed' });
+    res.status(503).json({ error: 'Book metadata temporarily unavailable.' });
   }
 });
 
 router.get('/books/:id/content', async (req, res) => {
   const id = String(req.params.id);
-  const cached = cacheGet(id);
-  if (cached != null) {
+  const cached = lruGet(textCache, id);
+  if (cached) {
     res.set('Cache-Control', 'public, max-age=86400');
-    res.type('text/plain; charset=utf-8').send(cached);
+    res.type('text/plain; charset=utf-8').send(cached.text);
     return;
   }
   try {
-    // Fetch metadata to find a plain-text format URL.
-    const metaRes = await fetch(GUTENDEX + '/books/' + encodeURIComponent(id));
-    if (!metaRes.ok) return res.status(metaRes.status).json({ error: 'Gutendex error' });
-    const meta = await metaRes.json();
-    const fmts = meta.formats || {};
-    const url =
+    // Need metadata to find the plain-text format URL. Use cached metadata if available.
+    const { data: meta } = await cachedJson(
+      'detail:' + id,
+      GUTENDEX + '/books/' + encodeURIComponent(id),
+      METADATA_CACHE_TTL_MS
+    );
+    const fmts = (meta && meta.formats) || {};
+    const finalUrl =
       fmts['text/plain; charset=utf-8'] ||
       fmts['text/plain'] ||
       fmts['text/plain; charset=us-ascii'] ||
-      // Some books only have .txt.utf-8 with a different key form
-      Object.keys(fmts).find((k) => k.startsWith('text/plain') && fmts[k]);
-    const finalUrl = typeof url === 'string' ? url : (url ? fmts[url] : null);
+      Object.entries(fmts).find(([k, v]) => k.startsWith('text/plain') && v)?.[1];
     if (!finalUrl) {
       return res.status(404).json({ error: 'No plain-text edition available for this book' });
     }
-    const r = await fetch(finalUrl);
+    // Book text downloads can be 500KB+, give them a longer timeout.
+    const r = await fetchWithTimeout(finalUrl, { timeoutMs: 20_000 });
     if (!r.ok) return res.status(r.status).json({ error: 'Failed to fetch book content' });
     const text = await r.text();
-    cacheSet(id, text);
+    lruSet(textCache, id, { text, fetchedAt: Date.now() }, MAX_ENTRIES);
     res.set('Cache-Control', 'public, max-age=86400');
     res.type('text/plain; charset=utf-8').send(text);
   } catch (err) {
     console.error('[books] content failed:', err.message);
-    res.status(502).json({ error: 'Upstream fetch failed' });
+    res.status(503).json({ error: 'Book content temporarily unavailable. Try again in a moment.' });
   }
 });
 

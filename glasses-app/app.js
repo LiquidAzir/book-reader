@@ -379,7 +379,9 @@
       state.cache[cacheKey] = { data: data, timestamp: Date.now() };
       renderBrowseResults(data);
     }).catch(function (err) {
-      list.innerHTML = '<div class="error-row">Couldn’t load. ' + escapeHtml(err.message || '') + '</div>';
+      list.innerHTML =
+        '<div class="error-row">Couldn’t load: ' + escapeHtml(err.message || 'network error') + '</div>' +
+        '<button class="nav-item primary focusable" data-action="browse-tab" data-tab="' + escapeHtml(tab) + '">Retry</button>';
     });
   }
   function renderBrowseResults(data) {
@@ -851,6 +853,11 @@
     pingServer().then(function () {
       if (state.currentScreen === 'home') renderHome();
       if (state.currentScreen === 'settings') renderSettings();
+      // Warm up: prefetch popular books so Browse is instant when the user opens it.
+      // Errors are silent — Browse will retry on demand.
+      fetchBookList({ sort: 'popular', page: 1 }).then(function (data) {
+        state.cache['browse:popular'] = { data: data, timestamp: Date.now() };
+      }).catch(function () {});
     });
     setTimeout(function () {
       navigateTo('home', { addToHistory: false });
