@@ -383,13 +383,19 @@
       if (direction === 'down') next = focusables[0];
       else if (direction === 'up') next = focusables[focusables.length - 1];
     }
-    // When entering a tab row (up from list, or down from header), snap to the
-    // currently-active tab rather than whichever is horizontally closest —
-    // matches the user's mental model of "the tab they're on".
+    // When *entering* a tab row from outside (up from list, down from header),
+    // snap to the active tab so the user lands on "the tab they're on". But
+    // not when moving sideways within the tab row — there they need free
+    // movement between tabs.
     if (next && next.classList.contains('tab-item') && !next.classList.contains('active')) {
       var tabBar = next.closest('.tab-bar');
-      var active = tabBar && tabBar.querySelector('.tab-item.active');
-      if (active && focusables.includes(active)) next = active;
+      var currentInSameTabBar =
+        current && current.classList && current.classList.contains('tab-item') &&
+        current.closest('.tab-bar') === tabBar;
+      if (!currentInSameTabBar) {
+        var active = tabBar && tabBar.querySelector('.tab-item.active');
+        if (active && focusables.includes(active)) next = active;
+      }
     }
     if (next) {
       next.focus();
