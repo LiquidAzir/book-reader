@@ -87,6 +87,34 @@ router.get('/books/:id', async (req, res) => {
   }
 });
 
+// Allow-listed proxy for direct Gutenberg .txt URLs. Used by the frontend's
+// fallback path when the catalog API is unreachable but we know the canonical
+// URL ahead of time (from the bundled fallback catalog).
+const ALLOWED_PROXY_HOSTS = new Set([
+  'www.gutenberg.org',
+  'gutenberg.org',
+  'www.gutenberg.net',
+]);
+router.get('/proxy', async (req, res) => {
+  const raw = String(req.query.url || '');
+  let url;
+  try { url = new URL(raw); }
+  catch { return res.status(400).json({ error: 'bad url' }); }
+  if (url.protocol !== 'https:' || !ALLOWED_PROXY_HOSTS.has(url.hostname)) {
+    return res.status(403).json({ error: 'host not allowed' });
+  }
+  try {
+    const r = await fetchWithTimeout(url.toString(), { timeoutMs: 20_000 });
+    if (!r.ok) return res.status(r.status).json({ error: 'upstream ' + r.status });
+    const text = await r.text();
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.type('text/plain; charset=utf-8').send(text);
+  } catch (err) {
+    console.error('[proxy] failed:', err.message);
+    res.status(503).json({ error: 'Upstream fetch failed' });
+  }
+});
+
 router.get('/books/:id/content', async (req, res) => {
   const id = String(req.params.id);
   const cached = lruGet(textCache, id);

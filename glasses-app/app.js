@@ -126,26 +126,35 @@
   }
 
   function fetchBookText(bookId) {
+    // Primary: ask our backend (which proxies Gutendex and caches).
     if (CONFIG.apiBaseUrl) {
-      return fetch(apiUrl('/api/books/' + bookId + '/content')).then(function (res) {
+      var primary = fetch(apiUrl('/api/books/' + bookId + '/content')).then(function (res) {
         if (!res.ok) throw new Error('HTTP ' + res.status);
         return res.text();
       });
+      // If backend fails (e.g. Gutendex down so it can't resolve the .txt URL),
+      // try the bundled fallback URL via the backend's pass-through proxy.
+      var fb = window.__BOOK_READER_FALLBACK_CATALOG__;
+      var entry = fb && fb.byId[bookId];
+      if (entry && entry.gutenbergTextUrl) {
+        return primary.catch(function () {
+          return fetch(apiUrl('/api/proxy?url=' + encodeURIComponent(entry.gutenbergTextUrl)))
+            .then(function (res) {
+              if (!res.ok) throw new Error('HTTP ' + res.status);
+              return res.text();
+            });
+        });
+      }
+      return primary;
     }
-    // Direct fallback: get metadata first, then fetch a text format URL.
-    // This will likely CORS-fail in many browsers — server mode is recommended.
-    return apiFetchJson(CONFIG.gutendexBaseUrl + '/books/' + bookId).then(function (meta) {
-      var fmts = (meta && meta.formats) || {};
-      var url =
-        fmts['text/plain; charset=utf-8'] ||
-        fmts['text/plain'] ||
-        fmts['text/plain; charset=us-ascii'];
-      if (!url) throw new Error('No plain-text edition available');
-      return fetch(url).then(function (r) {
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        return r.text();
+    // No backend: try direct (will usually CORS-fail).
+    return fetch(CONFIG.gutendexBaseUrl + '/books/' + bookId).then(function (r) { return r.json(); })
+      .then(function (meta) {
+        var fmts = (meta && meta.formats) || {};
+        var url = fmts['text/plain; charset=utf-8'] || fmts['text/plain'];
+        if (!url) throw new Error('No plain-text edition available');
+        return fetch(url).then(function (r) { return r.text(); });
       });
-    });
   }
 
   // ---- User data (server is source-of-truth when present) ----
@@ -379,9 +388,22 @@
       state.cache[cacheKey] = { data: data, timestamp: Date.now() };
       renderBrowseResults(data);
     }).catch(function (err) {
-      list.innerHTML =
-        '<div class="error-row">Couldn’t load: ' + escapeHtml(err.message || 'network error') + '</div>' +
-        '<button class="nav-item primary focusable" data-action="browse-tab" data-tab="' + escapeHtml(tab) + '">Retry</button>';
+      // Catalog API failed — serve the bundled fallback list so Browse still works.
+      console.warn('[browse] catalog API failed, using fallback catalog:', err.message);
+      var fallback = window.__BOOK_READER_FALLBACK_CATALOG__;
+      if (fallback) {
+        var entries = fallback.forTab(tab).map(function (b) {
+          return { id: b.id, title: b.title, author: b.author, subjects: b.subjects, downloadCount: null, _fromFallback: true };
+        });
+        renderBookList('browse-list', entries.map(function (b) {
+          b.metaLine = 'Offline catalog';
+          return b;
+        }), { emptyMessage: 'No books found' });
+      } else {
+        list.innerHTML =
+          '<div class="error-row">Couldn’t load: ' + escapeHtml(err.message || 'network error') + '</div>' +
+          '<button class="nav-item primary focusable" data-action="browse-tab" data-tab="' + escapeHtml(tab) + '">Retry</button>';
+      }
     });
   }
   function renderBrowseResults(data) {
@@ -409,7 +431,15 @@
       var books = (data.results || []).map(normalizeGutendexBook);
       renderBookList('search-results', books, { emptyMessage: 'No results' });
     }).catch(function (err) {
-      results.innerHTML = '<div class="error-row">Search failed. ' + escapeHtml(err.message || '') + '</div>';
+      var fallback = window.__BOOK_READER_FALLBACK_CATALOG__;
+      if (fallback) {
+        var hits = fallback.search(q).map(function (b) {
+          return { id: b.id, title: b.title, author: b.author, metaLine: 'Offline catalog', _fromFallback: true };
+        });
+        renderBookList('search-results', hits, { emptyMessage: 'No matches in offline catalog' });
+      } else {
+        results.innerHTML = '<div class="error-row">Search failed. ' + escapeHtml(err.message || '') + '</div>';
+      }
     });
   }
 
@@ -443,7 +473,19 @@
       var full = normalizeGutendexBook(raw);
       state.detailBook = full;
       if (state.currentScreen === 'book-detail') renderBookDetail();
-    }).catch(function () { /* keep basic info */ });
+    }).catch(function () {
+      // Catalog metadata unavailable — enrich from the fallback catalog if we know this book.
+      var fb = window.__BOOK_READER_FALLBACK_CATALOG__;
+      var entry = fb && fb.byId[book.id];
+      if (entry) {
+        state.detailBook = {
+          id: book.id, title: entry.title, author: entry.author,
+          subjects: entry.subjects, description: '',
+          gutenbergTextUrl: entry.gutenbergTextUrl,
+        };
+        if (state.currentScreen === 'book-detail') renderBookDetail();
+      }
+    });
     navigateTo('book-detail');
   }
 
