@@ -108,8 +108,30 @@
     return init;
   }
 
+  // Hard client-side timeout via AbortController. fetch() with no signal can
+  // hang indefinitely if the connection stalls (Render dyno cold start, flaky
+  // network) — bound it so the user always gets either a response or an error.
+  function fetchWithTimeout(url, init, timeoutMs) {
+    init = init || {};
+    timeoutMs = timeoutMs || 25000;
+    if (typeof AbortController === 'function') {
+      var ctrl = new AbortController();
+      var timer = setTimeout(function () { ctrl.abort(); }, timeoutMs);
+      init.signal = ctrl.signal;
+      return fetch(url, init).then(function (res) {
+        clearTimeout(timer);
+        return res;
+      }, function (err) {
+        clearTimeout(timer);
+        if (err && err.name === 'AbortError') throw new Error('Request timed out');
+        throw err;
+      });
+    }
+    return fetch(url, init);
+  }
+
   function apiFetchJson(url, init) {
-    return fetch(url, init).then(function (res) {
+    return fetchWithTimeout(url, init).then(function (res) {
       if (!res.ok) throw new Error('HTTP ' + res.status);
       return res.json();
     });
@@ -553,11 +575,28 @@
       renderPopularInitial(cached.data);
       return;
     }
-    fetchBookList({ sort: 'popular', page: 1 }).then(function (data) {
+    // Update loading text if it takes more than a couple seconds — server may
+    // be cold-starting (Render free tier sleeps after 15 min idle).
+    var slowMsgTimer = setTimeout(function () {
+      var lr = list.querySelector('.loading-row');
+      if (lr) lr.textContent = 'Loading… (server may be waking up)';
+    }, 4000);
+
+    // Fetch once, retry once silently on failure — covers the dyno cold-start
+    // case where the first request times out but the second hits a warm server.
+    function fetchOnce() { return fetchBookList({ sort: 'popular', page: 1 }); }
+    fetchOnce().catch(function (err) {
+      console.warn('[browse] popular first attempt failed, retrying:', err.message);
+      var lr = list.querySelector('.loading-row');
+      if (lr) lr.textContent = 'Retrying…';
+      return fetchOnce();
+    }).then(function (data) {
+      clearTimeout(slowMsgTimer);
       state.cache[cacheKey] = { data: data, timestamp: Date.now() };
       renderPopularInitial(data);
     }).catch(function (err) {
-      console.warn('[browse] catalog API failed, using fallback catalog:', err.message);
+      clearTimeout(slowMsgTimer);
+      console.warn('[browse] catalog API failed after retry, using fallback catalog:', err.message);
       if (fallback) {
         var fb = fallback.forTab('popular').map(function (b) {
           return { id: b.id, title: b.title, author: b.author, metaLine: 'Offline catalog' };
