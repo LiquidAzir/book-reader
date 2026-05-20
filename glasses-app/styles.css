@@ -480,12 +480,30 @@ body {
 }
 
 /* --- Loading / Error placeholders --- */
+/* Every "Loading…" string gets an inline rotating ring before it. Pure CSS
+   animation so the motion keeps going even if the JS thread is busy — that's
+   the whole point: visible proof the app isn't frozen. */
 .loading-row {
   padding: 20px;
   text-align: center;
   color: var(--text-secondary);
   font-size: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
 }
+.loading-row::before {
+  content: '';
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--bg-tertiary);
+  border-top-color: var(--accent-primary);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
 .empty-row {
   padding: 30px 20px;
   text-align: center;
