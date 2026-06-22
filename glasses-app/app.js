@@ -179,6 +179,21 @@
     return firstSuccess([primaryPromise, proxyPromise]);
   }
 
+  // Retry a promise-returning function up to maxAttempts times with linear
+  // backoff (0s, 1s, 2s, ...). Surfaces only the final error.
+  function retryWithBackoff(fn, maxAttempts) {
+    function tryAttempt(n) {
+      return fn().catch(function (err) {
+        if (n + 1 >= maxAttempts) throw err;
+        var statusEl = document.getElementById('reader-load-status');
+        if (statusEl) statusEl.textContent = 'Retrying… (attempt ' + (n + 2) + ' of ' + maxAttempts + ')';
+        return new Promise(function (r) { setTimeout(r, (n + 1) * 1000); })
+          .then(function () { return tryAttempt(n + 1); });
+      });
+    }
+    return tryAttempt(0);
+  }
+
   // Resolves with the first promise that fulfills. Rejects only when all reject.
   function firstSuccess(promises) {
     return new Promise(function (resolve, reject) {
@@ -826,10 +841,12 @@
       if (secs >= 3) statusEl.textContent = 'Loading book… ' + secs + 's';
     }, 1000);
 
-    // Promise.resolve().then() converts any synchronous throw inside
-    // fetchBookText into a Promise rejection so .catch can show the error UI
-    // (e.g. if a referenced API like Promise.any didn't exist on this browser).
-    Promise.resolve().then(function () { return fetchBookText(b.id); }).then(function (text) {
+    // Gutenberg downloads can flake intermittently (Render IPs sometimes hit
+    // gutenberg.org throttling). Retry up to 3 times with backoff before
+    // surfacing an error — totally invisible to the user when transient.
+    Promise.resolve().then(function () {
+      return retryWithBackoff(function () { return fetchBookText(b.id); }, 3);
+    }).then(function (text) {
       clearInterval(loadTimer);
       var cleaned = stripGutenbergBoilerplate(text);
       state.reader.text = cleaned;
@@ -839,11 +856,13 @@
       addToRecents();
     }).catch(function (err) {
       clearInterval(loadTimer);
+      // Log technical detail to console but show a friendly message in the UI.
+      console.warn('[openBook] failed after retries:', err && err.message);
       document.getElementById('reader-page-inner').innerHTML =
-        '<div class="error-row">Couldn’t load book.<br>' +
-        escapeHtml(err.message || '') +
+        '<div class="error-row">Couldn’t load this book.<br>' +
+        'Gutenberg.org may be temporarily unavailable. Try again in a minute.' +
         '</div>' +
-        '<button class="nav-item primary focusable" data-action="retry-open-book" style="margin-top:16px">Retry</button>';
+        '<button class="nav-item primary focusable" data-action="retry-open-book" style="margin-top:16px">Try again</button>';
       focusFirst(screens.reader);
     });
   }
