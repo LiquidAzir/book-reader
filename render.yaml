@@ -1,13 +1,8 @@
 # Render Blueprint for Book Reader.
-# Provisions: static site (frontend) + web service (API) + managed Postgres.
+# Provisions: static site (frontend) + web service (API).
+# Postgres lives on Neon's free tier (migrated 2026-08 off the paid Render DB).
 # Apply by pushing this file to a connected Git repo and running
 # "Blueprint → New Blueprint Instance" in the Render dashboard.
-
-databases:
-  - name: book-reader-db
-    plan: free
-    databaseName: book_reader
-    user: book_reader
 
 services:
   # ---- Backend API ----
@@ -23,9 +18,10 @@ services:
       - key: NODE_VERSION
         value: 20
       - key: DATABASE_URL
-        fromDatabase:
-          name: book-reader-db
-          property: connectionString
+        # Neon Postgres connection URL. KEEP the ?sslmode=require query param:
+        # src/db.js only forces TLS for render.com hosts, so for Neon the URL
+        # itself must request SSL (node-pg reads sslmode from the query string).
+        sync: false
       - key: CORS_ORIGINS
         # After first deploy of the static site, set this to its exact URL.
         # Leave as "*" while iterating to avoid CORS pain.
