@@ -39,7 +39,9 @@ async function readUpstream(raw, { validate = bookUrl, validateRedirect, timeout
     }
     if (!response.ok) {
       await response.body?.cancel();
-      throw new UpstreamError(response.status === 404 ? 'Book not found' : 'Book service temporarily unavailable', response.status === 404 ? 404 : 503);
+      const error = new UpstreamError(response.status === 404 ? 'Book not found' : 'Book service temporarily unavailable', response.status === 404 ? 404 : 503);
+      error.code = 'UPSTREAM_HTTP_' + response.status;
+      throw error;
     }
     const length = Number(response.headers.get('content-length'));
     if (length > maxBytes) { await response.body?.cancel(); throw new UpstreamError('Book response is too large', 413); }

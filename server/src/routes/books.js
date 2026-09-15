@@ -55,6 +55,8 @@ async function bookText(raw) {
 }
 function failure(res, err, fallback) {
   const status = err instanceof UpstreamError ? err.status : 503;
+  // Operational diagnostics contain only error codes, never URLs, book text or identity.
+  console.warn('[book-upstream]', err.code || err.cause?.code || err.name || 'Error', status);
   if (status === 503) res.set('Retry-After', '10');
   res.set('Cache-Control', 'no-store').status(status).json({ error: status === 404 ? 'Book not found' : status === 413 ? 'This text edition is too large to load.' : fallback });
 }
