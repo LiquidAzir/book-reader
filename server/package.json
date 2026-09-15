@@ -8,10 +8,11 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "db:migrate": "node src/migrate.js"
+    "db:migrate": "node src/migrate.js",
+    "test": "node --test tests/*.test.cjs"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22 <23"
   },
   "dependencies": {
     "cors": "^2.8.5",

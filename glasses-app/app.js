@@ -26,11 +26,14 @@
     cache: {},
     deviceId: null,
     serverAvailable: false,
+    syncAvailable: false,
     data: {
       // Persisted user data
       favorites: {},        // bookId -> { id, title, author, addedAt }
       recents: [],          // [{ id, title, author, lastReadAt }] most-recent first, capped
       progress: {},         // bookId -> { fraction: 0..1, updatedAt }
+      syncQueue: {},
+      favoriteRemoved: {},
       settings: {
         textSizeIdx: 2,       // index into CONFIG.textSizes (L) — readable default on additive display
         lineSpacingIdx: 1,    // index into CONFIG.lineSpacings (1.5)
@@ -55,6 +58,8 @@
   };
 
   var screens = {};
+  var readGeneration = 0, readController = null, searchGeneration = 0, detailGeneration = 0;
+  var syncing = {}, retryTimer = null;
 
   // ==================== DEVICE ID ====================
   function ensureDeviceId() {
@@ -80,14 +85,22 @@
       if (!raw) return;
       var parsed = JSON.parse(raw);
       if (parsed && typeof parsed === 'object') {
-        if (parsed.favorites) state.data.favorites = parsed.favorites;
-        if (parsed.recents)   state.data.recents = parsed.recents;
-        if (parsed.progress)  state.data.progress = parsed.progress;
+        if (parsed.favorites && typeof parsed.favorites === 'object' && !Array.isArray(parsed.favorites)) state.data.favorites = parsed.favorites;
+        if (Array.isArray(parsed.recents)) state.data.recents = parsed.recents.filter(function(b) { return b && Number.isInteger(b.id) && b.id > 0 && typeof b.title === 'string'; }).slice(0,20);
+        if (parsed.progress && typeof parsed.progress === 'object' && !Array.isArray(parsed.progress)) state.data.progress = parsed.progress;
         if (parsed.settings)  Object.assign(state.data.settings, parsed.settings);
+        state.data.syncQueue = parsed.syncQueue || {};
+        state.data.favoriteRemoved = parsed.favoriteRemoved || {};
       }
-    } catch (e) {
-      console.error('[Storage] Load error:', e);
-    }
+    } catch (e) { /* Keep usable defaults when browser data is malformed. */ }
+    ['textSizeIdx','lineSpacingIdx'].forEach(function(k) {
+      var max = k === 'textSizeIdx' ? CONFIG.textSizes.length : CONFIG.lineSpacings.length;
+      if (!Number.isInteger(state.data.settings[k]) || state.data.settings[k] < 0 || state.data.settings[k] >= max) state.data.settings[k] = k === 'textSizeIdx' ? 2 : 1;
+    });
+    state.data.syncQueue = state.data.syncQueue && typeof state.data.syncQueue === 'object' ? state.data.syncQueue : {};
+    state.data.favoriteRemoved = state.data.favoriteRemoved && typeof state.data.favoriteRemoved === 'object' ? state.data.favoriteRemoved : {};
+    Object.keys(state.data.favorites).forEach(function(key){var b=state.data.favorites[key];if(!b||!Number.isInteger(b.id)||b.id<=0||typeof b.title!=='string')delete state.data.favorites[key];});
+    Object.keys(state.data.progress).forEach(function(key){var p=state.data.progress[key];if(!p||!Number.isFinite(Number(p.fraction))||Number(p.fraction)<0||Number(p.fraction)>1)delete state.data.progress[key];});
   }
 
   function saveData() {
@@ -116,6 +129,8 @@
     timeoutMs = timeoutMs || 25000;
     if (typeof AbortController === 'function') {
       var ctrl = new AbortController();
+      var outer = init.signal;
+      if (outer) { if (outer.aborted) ctrl.abort(); else outer.addEventListener('abort', function() { ctrl.abort(); }, {once:true}); }
       var timer = setTimeout(function () { ctrl.abort(); }, timeoutMs);
       init.signal = ctrl.signal;
       return fetch(url, init).then(function (res) {
@@ -123,7 +138,7 @@
         return res;
       }, function (err) {
         clearTimeout(timer);
-        if (err && err.name === 'AbortError') throw new Error('Request timed out');
+        if (err && err.name === 'AbortError' && !(outer && outer.aborted)) throw new Error('Request timed out');
         throw err;
       });
     }
@@ -148,15 +163,15 @@
     return apiFetchJson(CONFIG.gutendexBaseUrl + '/books?' + qs);
   }
 
-  function fetchBookText(bookId) {
+  function fetchBookText(bookId, signal) {
     if (!CONFIG.apiBaseUrl) {
       // No backend: try direct (will usually CORS-fail). Kept for local-only dev.
-      return fetch(CONFIG.gutendexBaseUrl + '/books/' + bookId).then(function (r) { return r.json(); })
+      return fetchWithTimeout(CONFIG.gutendexBaseUrl + '/books/' + bookId, {signal:signal}).then(function (r) { return r.json(); })
         .then(function (meta) {
           var fmts = (meta && meta.formats) || {};
           var url = fmts['text/plain; charset=utf-8'] || fmts['text/plain'];
           if (!url) throw new Error('No plain-text edition available');
-          return fetch(url).then(function (r) { return r.text(); });
+          return fetchWithTimeout(url, {signal:signal}).then(function (r) { if (!r.ok) throw new Error('Book unavailable'); return r.text(); });
         });
     }
     // Race two retrieval paths in parallel:
@@ -164,14 +179,14 @@
     //   proxy:   /api/proxy?url=...     — direct gutenberg.org via our backend
     // Hand-rolled "first-success" race instead of Promise.any so we don't
     // depend on Chrome 85+ — the embedded Display glasses browser may be older.
-    var primaryPromise = fetch(apiUrl('/api/books/' + bookId + '/content')).then(function (res) {
+    var primaryPromise = fetchWithTimeout(apiUrl('/api/books/' + bookId + '/content'), {signal:signal}).then(function (res) {
       if (!res.ok) throw new Error('primary ' + res.status);
       return res.text();
     });
     var fb = window.__BOOK_READER_FALLBACK_CATALOG__;
     var entry = fb && fb.byId[bookId];
     if (!(entry && entry.gutenbergTextUrl)) return primaryPromise;
-    var proxyPromise = fetch(apiUrl('/api/proxy?url=' + encodeURIComponent(entry.gutenbergTextUrl)))
+    var proxyPromise = fetchWithTimeout(apiUrl('/api/proxy?url=' + encodeURIComponent(entry.gutenbergTextUrl)), {signal:signal})
       .then(function (res) {
         if (!res.ok) throw new Error('proxy ' + res.status);
         return res.text();
@@ -218,42 +233,76 @@
   }
 
   // ---- User data (server is source-of-truth when present) ----
-  function serverSyncFavoriteAdd(book) {
+  // Local changes are durable first. Each key has at most one request in flight,
+  // so a slow response cannot overwrite a newer page or favorite choice.
+  function queueSync(kind, id, payload) {
+    if (!CONFIG.apiBaseUrl) return;
+    if(kind!=='progress' && payload)payload={title:String(payload.title||'Untitled').slice(0,2000),author:String(payload.author||'').slice(0,1000)};
+    var key = kind + ':' + id;
+    state.data.syncQueue[key] = {kind:kind, id:id, payload:payload, stamp:Date.now()};
+    saveData(); drainSync(key);
+  }
+  function drainSync(key) {
+    if (syncing[key] || !CONFIG.apiBaseUrl) return;
+    var item = state.data.syncQueue[key];
+    if (!item || !Number.isInteger(item.id) || item.id <= 0 || !['favorite','progress','recent'].includes(item.kind)) return;
+    var url, method, body;
+    if (item.kind === 'progress') { url='/api/me/progress/'+item.id; method='PUT'; body={fraction:item.payload.fraction}; }
+    if (item.kind === 'recent') { url='/api/me/recents'; method='POST'; body={bookId:item.id,title:item.payload.title,author:item.payload.author}; }
+    if (item.kind === 'favorite') { url='/api/me/favorites'+(item.payload ? '' : '/'+item.id); method=item.payload?'POST':'DELETE'; body=item.payload&&{bookId:item.id,title:item.payload.title,author:item.payload.author}; }
+    syncing[key] = true;
+    fetchWithTimeout(apiUrl(url), withDeviceHeader({method:method,keepalive:true,headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined}),15000)
+      .then(function(res) { if (!res.ok) throw new Error('Sync unavailable'); state.syncAvailable=true; if (state.data.syncQueue[key] === item) delete state.data.syncQueue[key]; saveData(); })
+      .catch(function() { state.syncAvailable=false; clearTimeout(retryTimer); retryTimer=setTimeout(retrySync,15000); })
+      .then(function() { delete syncing[key]; if (state.data.syncQueue[key] && state.data.syncQueue[key] !== item) drainSync(key); if(state.currentScreen==='settings')renderSettings(); });
+  }
+  function retrySync() { Object.keys(state.data.syncQueue).forEach(drainSync); }
+  function hydrateLibrary() {
     if (!CONFIG.apiBaseUrl) return Promise.resolve();
-    return fetch(apiUrl('/api/me/favorites'), withDeviceHeader({
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ bookId: book.id, title: book.title, author: book.author }),
-    })).catch(function () { /* offline-tolerant */ });
+    return Promise.all([
+      apiFetchJson(apiUrl('/api/me/favorites'),withDeviceHeader()).then(function(data) {
+        var remoteIds={};
+        (Array.isArray(data.favorites)?data.favorites:[]).forEach(function(b) {
+          remoteIds[b.id]=true;
+          if (!Number.isInteger(b.id) || b.id <= 0 || !b.title || state.data.syncQueue['favorite:'+b.id]) return;
+          if (Number(b.addedAt) <= (state.data.favoriteRemoved[b.id] || 0)) return;
+          var local=state.data.favorites[b.id];
+          if (!local || Number(b.addedAt)>Number(local.addedAt)) state.data.favorites[b.id]=b;
+        });
+        Object.keys(state.data.favorites).forEach(function(id){if(!remoteIds[id]&&!state.data.syncQueue['favorite:'+id])serverSyncFavoriteAdd(state.data.favorites[id]);});
+      }),
+      apiFetchJson(apiUrl('/api/me/recents'),withDeviceHeader()).then(function(data) {
+        var combined={}; state.data.recents.forEach(function(b) { combined[b.id]=b; });
+        (Array.isArray(data.recents)?data.recents:[]).forEach(function(b) {
+          if (!Number.isInteger(b.id) || b.id <= 0 || !b.title || b.title==='(unknown)') return;
+          if (!combined[b.id] || Number(b.lastReadAt)>Number(combined[b.id].lastReadAt)) combined[b.id]=b;
+          var p=state.data.progress[b.id];
+          if (!state.data.syncQueue['progress:'+b.id] && Number.isFinite(Number(b.fraction)) && (!p || Number(b.lastReadAt)>Number(p.updatedAt)) && !(p && Math.abs(p.fraction-Number(b.fraction))<.000001)) {
+            state.data.progress[b.id]={fraction:Number(b.fraction),updatedAt:Number(b.lastReadAt),anchorVersion:1};
+          }
+        });
+        state.data.recents=Object.values(combined).sort(function(a,b){return Number(b.lastReadAt)-Number(a.lastReadAt);}).slice(0,20);
+      })
+    ]).then(function(){state.syncAvailable=true;saveData();if(state.currentScreen==='home')renderHome();if(state.currentScreen==='library')renderLibrary();}).catch(function(){state.syncAvailable=false;saveData(); /* Offline library stays intact. */ });
+  }
+  function serverSyncFavoriteAdd(book) {
+    queueSync('favorite',book.id,book);
   }
   function serverSyncFavoriteRemove(bookId) {
-    if (!CONFIG.apiBaseUrl) return Promise.resolve();
-    return fetch(apiUrl('/api/me/favorites/' + bookId), withDeviceHeader({
-      method: 'DELETE',
-    })).catch(function () {});
+    queueSync('favorite',bookId,null);
   }
   function serverSyncProgress(bookId, fraction) {
-    if (!CONFIG.apiBaseUrl) return Promise.resolve();
-    return fetch(apiUrl('/api/me/progress/' + bookId), withDeviceHeader({
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ fraction: fraction }),
-    })).catch(function () {});
+    queueSync('progress',bookId,{fraction:fraction});
   }
   function serverSyncRecent(book) {
-    if (!CONFIG.apiBaseUrl) return Promise.resolve();
-    return fetch(apiUrl('/api/me/recents'), withDeviceHeader({
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ bookId: book.id, title: book.title, author: book.author }),
-    })).catch(function () {});
+    queueSync('recent',book.id,book);
   }
   function pingServer() {
     if (!CONFIG.apiBaseUrl) {
       state.serverAvailable = false;
       return Promise.resolve(false);
     }
-    return fetch(apiUrl('/api/health')).then(function (res) {
+    return fetchWithTimeout(apiUrl('/api/health')).then(function (res) {
       state.serverAvailable = res.ok;
       return res.ok;
     }).catch(function () {
@@ -267,10 +316,14 @@
     document.querySelectorAll('.screen').forEach(function (s) {
       if (s.id) screens[s.id] = s;
     });
+    document.querySelectorAll('[data-action="back"]').forEach(function(b){b.setAttribute('aria-label',b.closest('#reader')?'Leave book':'Back');});
   }
 
   function navigateTo(screenId, options) {
     options = options || {};
+    if (state.currentScreen === 'reader' && screenId !== 'reader') {
+      flushProgress(); state.reader.ready=false; readGeneration++; if(readController)readController.abort(); closeReaderMenu();
+    }
     var addToHistory = options.addToHistory !== false;
     if (addToHistory && state.currentScreen && state.currentScreen !== screenId) {
       state.screenHistory.push(state.currentScreen);
@@ -283,7 +336,7 @@
       // Reader starts in "reading mode" with no toolbar focus so ←/→ go
       // straight to page-turning. User presses ↑ to reveal the back button.
       if (screenId === 'reader') {
-        if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+        document.getElementById('reader-page').focus();
       } else {
         focusFirst(screens[screenId]);
       }
@@ -291,9 +344,6 @@
   }
 
   function navigateBack() {
-    if (state.currentScreen === 'reader') {
-      flushProgress();
-    }
     if (state.screenHistory.length > 0) {
       navigateTo(state.screenHistory.pop(), { addToHistory: false });
       return;
@@ -321,6 +371,9 @@
   }
 
   function focusFirst(container) {
+    if(container===screens['book-detail']){document.querySelector('[data-action="open-book"]').focus();return;}
+    if(container===screens.browse || container===screens.library){var book=container.querySelector('.book-item');if(book){book.focus();return;}}
+    if(container===screens.search){document.getElementById('search-input').focus();return;}
     var els = visibleFocusables(container);
     if (els.length) els[0].focus();
   }
@@ -375,12 +428,17 @@
       var toolbar = document.querySelector('#reader .reader-toolbar');
       var inToolbar = rActive && rActive.closest && rActive.closest('.reader-toolbar');
       if (inToolbar) {
-        if (direction === 'down') { rActive.blur(); return; }
+        if (direction === 'down') { document.getElementById('reader-page').focus(); return; }
         if (direction === 'up')   { return; }
         var btns = visibleFocusables(toolbar);
         var ti = btns.indexOf(rActive);
         if (direction === 'left')  { if (ti > 0) btns[ti - 1].focus(); return; }
         if (direction === 'right') { if (ti < btns.length - 1) btns[ti + 1].focus(); return; }
+      }
+      if (rActive && rActive.closest && rActive.closest('.reader-footer')) {
+        if (direction === 'up') { document.getElementById('reader-page').focus(); return; }
+        var footerButtons=visibleFocusables(document.getElementById('reader-footer'));
+        var target=moveFocusSpatial(footerButtons,rActive,direction); if(target)target.focus(); return;
       }
       // Reading mode
       if (direction === 'left')  { pageBack();    return; }
@@ -437,7 +495,7 @@
     }
     if (next) {
       next.focus();
-      next.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      next.scrollIntoView({ block: 'nearest', behavior: 'auto' });
     }
   }
 
@@ -448,7 +506,8 @@
       toast = document.createElement('div');
       toast.id = 'toast';
       toast.className = 'toast';
-      document.body.appendChild(toast);
+      document.getElementById('app').appendChild(toast);
+      toast.setAttribute('role','status');
     }
     toast.textContent = message;
     toast.className = 'toast' + (type ? ' ' + type : '');
@@ -465,19 +524,32 @@
     btn.dataset.bookId = String(b.id);
     btn.dataset.bookTitle = b.title || '';
     btn.dataset.bookAuthor = b.author || '';
-    btn.innerHTML =
-      '<div class="book-item-title">' + escapeHtml(b.title || 'Untitled') + '</div>' +
+    btn.setAttribute('aria-label',(b.title||'Untitled')+', by '+(b.author||'Unknown'));
+    btn.innerHTML = coverHTML(b) + '<span class="book-copy">' +
+      '<span class="book-item-title">' + escapeHtml(b.title || 'Untitled') + '</span>' +
       '<div class="book-item-author">' + escapeHtml(b.author || 'Unknown') + '</div>' +
       (b.metaLine
         ? '<div class="book-item-meta">' + escapeHtml(b.metaLine) + '</div>'
-        : '');
+        : '') + '</span>';
     return btn;
+  }
+  function coverHTML(b) {
+    var letter=(b.title||'Book').replace(/^(the|a|an)\s+/i,'').trim().charAt(0).toUpperCase();
+    return '<span class="book-cover cover-'+(Number(b.id)%6)+'" aria-hidden="true"><span class="cover-monogram">'+escapeHtml(letter)+'</span></span>';
+  }
+  function renderFeatured() {
+    var holder=document.getElementById('home-featured'),fb=window.__BOOK_READER_FALLBACK_CATALOG__;
+    if(!holder || !fb)return;
+    if(holder.children.length)return;
+    holder.innerHTML='';
+    [1342,11,84].forEach(function(id){var b=fb.byId[id];if(!b)return;var item=bookListItem(b);item.className='featured-book focusable';item.innerHTML=coverHTML(b)+'<span class="book-caption">'+escapeHtml(b.title)+'</span>';holder.appendChild(item);});
   }
 
   function renderBookList(containerId, books, opts) {
     opts = opts || {};
     var container = document.getElementById(containerId);
     if (!container) return;
+    var focused=container.contains(document.activeElement)?document.activeElement.dataset.bookId:null;
     container.innerHTML = '';
     if (!books || books.length === 0) {
       var msg = opts.emptyMessage || 'No books found';
@@ -485,6 +557,7 @@
       return;
     }
     books.forEach(function (b) { container.appendChild(bookListItem(b)); });
+    if(focused){var replacement=Array.from(container.children).find(function(b){return b.dataset.bookId===focused;})||container.querySelector('.book-item');if(replacement)replacement.focus({preventScroll:true});}
   }
 
   function appendBooksToList(containerId, books) {
@@ -536,11 +609,14 @@
       document.getElementById('continue-author').textContent = recent.author || '';
       var pct = Math.round(((state.data.progress[recent.id] || {}).fraction || 0) * 100);
       document.getElementById('continue-progress').style.width = pct + '%';
+      document.getElementById('continue-percent').textContent=pct+'% of your journey';
       card.classList.remove('hidden');
     } else {
       card.classList.add('hidden');
     }
-    var status = state.serverAvailable ? 'Online' : 'Offline';
+    document.getElementById('library-welcome').classList.toggle('hidden',!!recent);
+    renderFeatured();
+    var status = state.serverAvailable ? 'Classics, connected' : 'Your personal shelf';
     document.getElementById('home-status').textContent = status;
   }
 
@@ -555,8 +631,10 @@
     state.browseTab = tab;
     document.querySelectorAll('#browse-tabs .tab-item').forEach(function (el) {
       el.classList.toggle('active', el.dataset.tab === tab);
+      el.setAttribute('aria-pressed',el.dataset.tab===tab);
     });
     var list = document.getElementById('browse-list');
+    document.getElementById('browse-load-more').innerHTML='';
     var fallback = window.__BOOK_READER_FALLBACK_CATALOG__;
 
     // Reset pagination state for this tab. generation lets us ignore stale
@@ -608,9 +686,11 @@
     }).then(function (data) {
       clearTimeout(slowMsgTimer);
       state.cache[cacheKey] = { data: data, timestamp: Date.now() };
+      if (state.browseTab !== tab || state.browseExtras[tab].generation !== gen || state.currentScreen !== 'browse') return;
       renderPopularInitial(data);
     }).catch(function (err) {
       clearTimeout(slowMsgTimer);
+      if (state.browseTab !== tab || state.browseExtras[tab].generation !== gen || state.currentScreen !== 'browse') return;
       console.warn('[browse] catalog API failed after retry, using fallback catalog:', err.message);
       if (fallback) {
         var fb = fallback.forTab('popular').map(function (b) {
@@ -628,6 +708,7 @@
     });
   }
   function renderPopularInitial(data) {
+    var restore = state.currentScreen==='browse' && (!document.activeElement || document.activeElement.classList.contains('back-btn') || !screens.browse.contains(document.activeElement));
     var books = (data.results || []).map(normalizeGutendexBook).map(function (b) {
       b.metaLine = b.downloadCount ? (b.downloadCount.toLocaleString() + ' downloads') : '';
       return b;
@@ -638,6 +719,7 @@
     ex.hasMore = !!data.next;
     renderBookList('browse-list', books, { emptyMessage: 'No books in this category' });
     updateLoadMoreButton();
+    if(restore)focusFirst(screens.browse);
   }
 
   function updateLoadMoreButton(errorMsg) {
@@ -662,6 +744,7 @@
   }
 
   function loadMoreBooks() {
+    var restoreFocus=!!(document.activeElement && document.activeElement.closest('#browse-load-more'));
     var tab = state.browseTab;
     var ex = state.browseExtras[tab];
     if (!ex || ex.loadingMore || !ex.hasMore) return;
@@ -693,10 +776,16 @@
       ex.hasMore = !!data.next;
       ex.loadingMore = false;
       updateLoadMoreButton();
+      if(restoreFocus && state.currentScreen==='browse'){
+        var next=fresh.length?document.querySelector('#browse-list [data-book-id="'+fresh[0].id+'"]'):document.querySelector('#browse-load-more .focusable');
+        if(!next)next=document.querySelector('#browse-list .book-item:last-child');
+        if(next){next.focus();next.scrollIntoView({block:'nearest'});}
+      }
     }).catch(function (err) {
       if (gen !== state.browseExtras[tab].generation || state.browseTab !== tab) return;
       ex.loadingMore = false;
       updateLoadMoreButton(err.message || 'Network error');
+      if(restoreFocus && state.currentScreen==='browse')focusFirst(document.getElementById('browse-load-more'));
     });
   }
 
@@ -705,6 +794,7 @@
     // No-op; results render after submit
   }
   function runSearch() {
+    var generation=++searchGeneration;
     var input = document.getElementById('search-input');
     var q = (input.value || '').trim();
     var results = document.getElementById('search-results');
@@ -712,11 +802,16 @@
       results.innerHTML = '<div class="empty-row">Enter a title or author</div>';
       return;
     }
+    document.getElementById('search-keyboard').classList.add('hidden');
+    document.getElementById('keyboard-toggle').setAttribute('aria-expanded','false');
+    document.getElementById('search-results').classList.remove('hidden');
     results.innerHTML = '<div class="loading-row">Searching…</div>';
     fetchBookList({ search: q }).then(function (data) {
+      if(generation!==searchGeneration)return;
       var books = (data.results || []).map(normalizeGutendexBook);
       renderBookList('search-results', books, { emptyMessage: 'No results' });
     }).catch(function (err) {
+      if(generation!==searchGeneration)return;
       var fallback = window.__BOOK_READER_FALLBACK_CATALOG__;
       if (fallback) {
         var hits = fallback.search(q).map(function (b) {
@@ -733,16 +828,20 @@
   function renderBookDetail() {
     var b = state.detailBook;
     if (!b) return;
-    document.getElementById('detail-title').textContent = b.title || 'Book';
+    document.getElementById('detail-name').textContent = b.title || 'Book';
+    document.getElementById('detail-cover').innerHTML=coverHTML(b);
     document.getElementById('detail-author').textContent = b.author || '';
     document.getElementById('detail-subjects').textContent =
       (b.subjects || []).slice(0, 3).join(' • ');
-    document.getElementById('detail-description').textContent = b.description || '';
+    document.getElementById('detail-description').textContent = b.description || 'A classic from the Project Gutenberg collection. Open the book to begin, or save it to your shelf for another day.';
     var btn = document.getElementById('detail-favorite-btn');
     btn.textContent = state.data.favorites[b.id] ? '★ Favorited' : '☆ Favorite';
+    btn.setAttribute('aria-pressed',!!state.data.favorites[b.id]);
+    document.querySelector('[data-action="open-book"]').textContent = (state.data.progress[b.id]||{}).fraction > 0 ? 'Resume reading' : 'Start reading';
   }
 
   function openBookDetailFromElement(el) {
+    var generation=++detailGeneration;
     var book = {
       id: Number(el.dataset.bookId),
       title: el.dataset.bookTitle,
@@ -756,10 +855,12 @@
       ? apiUrl('/api/books/' + book.id)
       : CONFIG.gutendexBaseUrl + '/books/' + book.id;
     apiFetchJson(url).then(function (raw) {
+      if(generation!==detailGeneration || !state.detailBook || state.detailBook.id!==book.id)return;
       var full = normalizeGutendexBook(raw);
       state.detailBook = full;
       if (state.currentScreen === 'book-detail') renderBookDetail();
     }).catch(function () {
+      if(generation!==detailGeneration || !state.detailBook || state.detailBook.id!==book.id)return;
       // Catalog metadata unavailable — enrich from the fallback catalog if we know this book.
       var fb = window.__BOOK_READER_FALLBACK_CATALOG__;
       var entry = fb && fb.byId[book.id];
@@ -780,12 +881,14 @@
     if (!b) return;
     if (state.data.favorites[b.id]) {
       delete state.data.favorites[b.id];
+      state.data.favoriteRemoved[b.id]=Date.now();
       serverSyncFavoriteRemove(b.id);
       showToast('Removed from favorites');
     } else {
       state.data.favorites[b.id] = {
         id: b.id, title: b.title, author: b.author, addedAt: Date.now(),
       };
+      delete state.data.favoriteRemoved[b.id];
       serverSyncFavoriteAdd(b);
       showToast('Added to favorites', 'success');
     }
@@ -797,6 +900,7 @@
   function renderLibrary() {
     document.querySelectorAll('#library .tab-item').forEach(function (el) {
       el.classList.toggle('active', el.dataset.tab === state.libraryTab);
+      el.setAttribute('aria-pressed',el.dataset.tab===state.libraryTab);
     });
     var list = document.getElementById('library-list');
     if (state.libraryTab === 'favorites') {
@@ -813,58 +917,52 @@
   function openBook() {
     var b = state.detailBook;
     if (!b) return;
-
-    state.reader.bookId = b.id;
-    state.reader.title = b.title;
-    state.reader.author = b.author;
-    state.reader.text = '';
-    state.reader.pages = [];
-    state.reader.currentPage = 0;
-    state.reader.pendingResumeFraction =
-      (state.data.progress[b.id] && state.data.progress[b.id].fraction) || 0;
-
+    flushProgress();
+    if (readController) readController.abort();
+    var generation = ++readGeneration;
+    var controller = readController = new AbortController();
+    var r = state.reader;
+    r.ready = false; r.bookId = b.id; r.title = b.title; r.author = b.author;
+    r.text = ''; r.pages = []; r.offsets = []; r.currentPage = 0; r.anchorOffset=0;
+    closeReaderMenu();
     document.getElementById('reader-toolbar-title').textContent = b.title;
-    var inner = document.getElementById('reader-page-inner');
-    inner.innerHTML = '<div class="loading-row" id="reader-load-status">Loading book…</div>';
-    document.getElementById('reader-page-num').textContent = '—';
-
-    navigateTo('reader');
-    applyTextSize();
-
-    // Surface elapsed time during long loads so the user isn't staring at a
-    // dead-looking "Loading…" string while we fight Gutendex.
-    var loadStart = Date.now();
-    var loadTimer = setInterval(function () {
-      var statusEl = document.getElementById('reader-load-status');
-      if (!statusEl) return clearInterval(loadTimer);
-      var secs = Math.floor((Date.now() - loadStart) / 1000);
-      if (secs >= 3) statusEl.textContent = 'Loading book… ' + secs + 's';
-    }, 1000);
-
-    // Gutenberg downloads can flake intermittently (Render IPs sometimes hit
-    // gutenberg.org throttling). Retry up to 3 times with backoff before
-    // surfacing an error — totally invisible to the user when transient.
-    Promise.resolve().then(function () {
-      return retryWithBackoff(function () { return fetchBookText(b.id); }, 3);
-    }).then(function (text) {
-      clearInterval(loadTimer);
-      var cleaned = stripGutenbergBoilerplate(text);
-      state.reader.text = cleaned;
+    document.getElementById('reader-page-inner').innerHTML = '<div class="loading-row" id="reader-load-status">Opening your book…</div>';
+    document.getElementById('reader-page-num').textContent = 'Finding your place';
+    navigateTo('reader'); applyTextSize(); updatePageDisplay();
+    var active = function() { return generation === readGeneration && state.currentScreen === 'reader' && state.reader.bookId === b.id; };
+    var deadline = setTimeout(function() { controller.abort(); }, 45000);
+    var slow = setTimeout(function() { if(active()) { var el=document.getElementById('reader-load-status'); if(el)el.textContent='Still opening… you can go back at any time.'; } },4000);
+    function retrieve(attempt) {
+      return fetchBookText(b.id, controller.signal).catch(function(err) {
+        if(controller.signal.aborted || !active() || attempt>=1)throw err;
+        return new Promise(function(resolve){setTimeout(resolve,600);}).then(function(){ if(controller.signal.aborted)throw new Error('Cancelled'); return retrieve(attempt+1); });
+      });
+    }
+    var remote = CONFIG.apiBaseUrl ? fetchWithTimeout(apiUrl('/api/me/progress/'+b.id),withDeviceHeader({signal:controller.signal}),4000)
+      .then(function(res){if(!res.ok)throw new Error('Local progress');return res.json();}).catch(function(){return null;}) : Promise.resolve(null);
+    Promise.all([retrieve(0),remote]).then(function(values) {
+      if(!active())return;
+      var cleaned=stripGutenbergBoilerplate(values[0]);
+      if(!cleaned || /^\s*<(?:!doctype|html)/i.test(cleaned))throw new Error('No readable text in this edition');
+      r.text=cleaned.split(/\n{2,}/).map(function(p){return p.replace(/\s+/g,' ').trim();}).filter(Boolean).join('\n\n');
+      var saved=state.data.progress[b.id] || {fraction:0}, remoteProgress=values[1];
+      if(remoteProgress && !state.data.syncQueue['progress:'+b.id] && Number.isFinite(Number(remoteProgress.fraction)) && Number(remoteProgress.updatedAt)>Number(saved.updatedAt||0) && Math.abs(Number(remoteProgress.fraction)-Number(saved.fraction))>.000001) {
+        saved={fraction:Number(remoteProgress.fraction),updatedAt:Number(remoteProgress.updatedAt),anchorVersion:1};state.data.progress[b.id]=saved;
+      }
       rebuildPages();
-      var resume = state.reader.pendingResumeFraction || 0;
-      seekToFraction(resume);
-      addToRecents();
-    }).catch(function (err) {
-      clearInterval(loadTimer);
-      // Log technical detail to console but show a friendly message in the UI.
-      console.warn('[openBook] failed after retries:', err && err.message);
-      document.getElementById('reader-page-inner').innerHTML =
-        '<div class="error-row">Couldn’t load this book.<br>' +
-        'Gutenberg.org may be temporarily unavailable. Try again in a minute.' +
-        '</div>' +
-        '<button class="nav-item primary focusable" data-action="retry-open-book" style="margin-top:16px">Try again</button>';
-      focusFirst(screens.reader);
-    });
+      if(Number.isInteger(saved.offset) && saved.textLength===r.text.length) seekToOffset(saved.offset);
+      else if(saved.anchorVersion===1) seekToOffset(Math.floor(Math.max(0,Math.min(1,Number(saved.fraction)||0))*r.text.length));
+      else seekToFraction(Number(saved.fraction)||0);
+      r.ready=true;updatePageDisplay();addToRecents();
+      if(readController===controller)readController=null;
+      controller.abort(); // Cancel any slower duplicate content retrieval.
+    }).catch(function(err) {
+      if(!active())return;
+      r.ready=false;
+      document.getElementById('reader-page-inner').innerHTML='<div class="error-row">This edition could not be opened.<br>Your saved place is safe. Try again, or choose another book.</div><button class="nav-item primary focusable" data-action="retry-open-book">Try again</button>';
+      document.getElementById('reader-page-num').textContent='Your place is saved';
+      document.querySelector('[data-action="retry-open-book"]').focus();
+    }).then(function(){clearTimeout(deadline);clearTimeout(slow);});
   }
 
   function stripGutenbergBoilerplate(text) {
@@ -876,7 +974,7 @@
     var body = text;
     if (startM) body = body.slice(startM.index + startM[0].length);
     if (endM)   body = body.slice(0, body.indexOf(endM[0]));
-    return body.replace(/\r\n/g, '\n').replace(/^\s+/, '').replace(/\s+$/, '');
+    return body.replace(/\r\n/g, '\n').replace(/(^|[\s(])_([^_\n]{1,240})_(?=$|[\s.,;:!?)])/g,'$1$2').replace(/^\s+/, '').replace(/\s+$/, '');
   }
 
   // ---- Pagination engine ----
@@ -884,100 +982,44 @@
   // sibling that matches the reader's font & width. Rendering only the current
   // page keeps the DOM tiny and scrolling smooth on the glasses.
   function rebuildPages() {
-    var text = state.reader.text;
-    if (!text) return;
-    var inner = document.getElementById('reader-page-inner');
-    var page = document.getElementById('reader-page');
-    var cs = window.getComputedStyle(inner);
-    var lineHeight = parseFloat(cs.lineHeight);
-    if (!lineHeight || isNaN(lineHeight)) lineHeight = parseFloat(cs.fontSize) * 1.5;
-    var linesPerPage = Math.max(1, Math.floor(page.clientHeight / lineHeight));
-    var pageHeightPx = linesPerPage * lineHeight;
-
-    // Measurer matches the inner's width and typography exactly
-    var meas = document.createElement('div');
-    meas.style.cssText = 'position:absolute;top:-99999px;left:0;visibility:hidden;';
-    meas.style.fontFamily = cs.fontFamily;
-    meas.style.fontSize = cs.fontSize;
-    meas.style.lineHeight = cs.lineHeight;
-    meas.style.width = inner.clientWidth + 'px';
-    meas.style.whiteSpace = 'normal';
-    meas.style.wordWrap = 'break-word';
-    document.body.appendChild(meas);
-
-    var paragraphs = text.split(/\n{2,}/)
-      .map(function (p) { return p.replace(/\n/g, ' ').replace(/\s+/g, ' ').trim(); })
-      .filter(Boolean);
-
-    function paragraphHeightPx(s) {
-      meas.textContent = s;
-      return meas.scrollHeight;
+    var text=state.reader.text;
+    if(!text)return;
+    var inner=document.getElementById('reader-page-inner'),page=document.getElementById('reader-page');
+    var cs=getComputedStyle(inner),lineHeight=parseFloat(cs.lineHeight)||parseFloat(cs.fontSize)*1.5;
+    var capacity=Math.max(lineHeight,Math.floor(page.clientHeight/lineHeight)*lineHeight);
+    var gap=parseFloat(cs.fontSize);
+    var measure=document.createElement('div');
+    measure.style.cssText='position:absolute;top:-99999px;left:0;visibility:hidden;margin:0;padding:0;border:0;';
+    measure.style.fontFamily=cs.fontFamily;measure.style.fontSize=cs.fontSize;measure.style.lineHeight=cs.lineHeight;
+    measure.style.width=inner.clientWidth+'px';measure.style.overflowWrap='anywhere';measure.style.whiteSpace='normal';
+    document.body.appendChild(measure);
+    function height(value){measure.textContent=value;return measure.getBoundingClientRect().height;}
+    function prefix(value,available){
+      var low=1,high=value.length,best=1;
+      while(low<=high){var mid=(low+high)>>1;if(height(value.slice(0,mid))<=available){best=mid;low=mid+1;}else high=mid-1;}
+      if(best<value.length){var space=value.lastIndexOf(' ',best);if(space>0)best=space;}
+      if(best<value.length && /[\uD800-\uDBFF]/.test(value[best-1]))best--;
+      if(best<1)best=Math.min(2,value.length);
+      return value.slice(0,best).trimEnd();
     }
-
-    function splitLongParagraph(s, maxHeightPx) {
-      // Splits a paragraph that's taller than a page into smaller chunks at
-      // word boundaries, each one fitting on its own page.
-      var words = s.split(/\s+/);
-      var chunks = [];
-      var lo = 0;
-      while (lo < words.length) {
-        var hi = words.length;
-        // Binary search for the largest prefix that fits
-        var best = lo + 1;
-        var l = lo + 1, r = words.length;
-        while (l <= r) {
-          var m = (l + r) >> 1;
-          meas.textContent = words.slice(lo, m).join(' ');
-          if (meas.scrollHeight <= maxHeightPx) { best = m; l = m + 1; }
-          else { r = m - 1; }
-        }
-        chunks.push(words.slice(lo, best).join(' '));
-        lo = best;
+    var pages=[],offsets=[],parts=[],used=0,pageOffset=0,sourceOffset=0;
+    function flush(){if(parts.length){pages.push(parts.map(function(p){return '<p>'+escapeHtml(p)+'</p>';}).join(''));offsets.push(pageOffset);}parts=[];used=0;}
+    text.split('\n\n').forEach(function(paragraph){
+      var remaining=paragraph,position=sourceOffset;sourceOffset+=paragraph.length+2;
+      while(remaining.length){
+        var margin=parts.length?gap:0,room=capacity-used-margin;
+        if(room<lineHeight){flush();continue;}
+        var fullHeight=height(remaining);
+        if(fullHeight<=room){if(!parts.length)pageOffset=position;parts.push(remaining);used+=margin+fullHeight;break;}
+        var chunk=prefix(remaining,room);
+        if(!parts.length)pageOffset=position;
+        parts.push(chunk);flush();position+=chunk.length;remaining=remaining.slice(chunk.length);
+        while(remaining[0]===' '){position++;remaining=remaining.slice(1);}
       }
-      return chunks;
-    }
-
-    var pages = [];
-    var current = [];          // array of paragraph strings on current page
-    var heightUsed = 0;
-    var marginPx = lineHeight; // p { margin-bottom: 1lh }
-
-    function flush() {
-      if (current.length) {
-        var html = current.map(function (p) {
-          return '<p>' + escapeHtml(p) + '</p>';
-        }).join('');
-        pages.push(html);
-      }
-      current = [];
-      heightUsed = 0;
-    }
-
-    for (var i = 0; i < paragraphs.length; i++) {
-      var p = paragraphs[i];
-      var ph = paragraphHeightPx(p);
-      if (ph > pageHeightPx) {
-        flush();
-        var chunks = splitLongParagraph(p, pageHeightPx);
-        for (var j = 0; j < chunks.length; j++) {
-          pages.push('<p>' + escapeHtml(chunks[j]) + '</p>');
-        }
-        continue;
-      }
-      var cost = (current.length === 0 ? 0 : marginPx) + ph;
-      if (heightUsed + cost <= pageHeightPx) {
-        current.push(p);
-        heightUsed += cost;
-      } else {
-        flush();
-        current.push(p);
-        heightUsed = ph;
-      }
-    }
-    flush();
-
-    document.body.removeChild(meas);
-    state.reader.pages = pages.length ? pages : [''];
+    });
+    flush();measure.remove();
+    state.reader.pages=pages.length?pages:[''];state.reader.offsets=offsets.length?offsets:[0];
+    state.reader.currentPage=Math.min(state.reader.currentPage,state.reader.pages.length-1);
     renderCurrentPage();
   }
 
@@ -998,6 +1040,11 @@
     if (settingsDisplay) settingsDisplay.textContent = size.label;
     var spacingDisplay = document.getElementById('settings-spacing-display');
     if (spacingDisplay) spacingDisplay.textContent = String(spacing);
+    document.getElementById('reader-spacing-display').textContent=String(spacing);
+    document.querySelectorAll('[data-action="text-size-down"]').forEach(function(b){b.disabled=state.data.settings.textSizeIdx===0;b.setAttribute('aria-label','Smaller text');});
+    document.querySelectorAll('[data-action="text-size-up"]').forEach(function(b){b.disabled=state.data.settings.textSizeIdx===CONFIG.textSizes.length-1;b.setAttribute('aria-label','Larger text');});
+    document.querySelectorAll('[data-action="line-spacing-down"]').forEach(function(b){b.disabled=state.data.settings.lineSpacingIdx===0;});
+    document.querySelectorAll('[data-action="line-spacing-up"]').forEach(function(b){b.disabled=state.data.settings.lineSpacingIdx===CONFIG.lineSpacings.length-1;});
   }
 
   function totalPages() {
@@ -1011,41 +1058,59 @@
   function openReaderMenu() {
     var menu = document.getElementById('reader-menu');
     menu.classList.remove('hidden');
+    screens.reader.classList.add('reader-menu-open');
     var first = menu.querySelector('.focusable');
     if (first) first.focus();
   }
   function closeReaderMenu() {
     var menu = document.getElementById('reader-menu');
     menu.classList.add('hidden');
+    screens.reader.classList.remove('reader-menu-open');
+    if(state.currentScreen==='reader')document.getElementById('reader-page').focus();
   }
 
   function pageForward() {
+    if(!state.reader.ready)return;
     if (state.reader.currentPage < totalPages() - 1) {
       state.reader.currentPage++;
+      state.reader.anchorOffset=state.reader.offsets[state.reader.currentPage];
       renderCurrentPage();
       scheduleProgressSave();
     }
   }
   function pageBack() {
+    if(!state.reader.ready)return;
     if (state.reader.currentPage > 0) {
       state.reader.currentPage--;
+      state.reader.anchorOffset=state.reader.offsets[state.reader.currentPage];
       renderCurrentPage();
       scheduleProgressSave();
     }
   }
   function updatePageDisplay() {
     document.getElementById('reader-page-num').textContent =
-      (state.reader.currentPage + 1) + ' / ' + totalPages();
+      state.reader.pages.length ? (state.reader.currentPage + 1) + ' / ' + totalPages() + ' · '+Math.round(currentFraction()*100)+'%' : 'Opening…';
+    document.getElementById('page-back').disabled=!state.reader.ready||state.reader.currentPage===0;
+    document.getElementById('page-forward').disabled=!state.reader.ready||state.reader.currentPage>=totalPages()-1;
+    document.getElementById('reading-track-fill').style.width=(currentFraction()*100)+'%';
   }
   function currentFraction() {
     var n = totalPages();
-    if (n <= 1) return 0;
-    return state.reader.currentPage / (n - 1);
+    if (n <= 1) return state.reader.ready ? 1 : 0;
+    if(state.reader.currentPage===n-1)return 1;
+    return currentOffset()/Math.max(1,state.reader.text.length);
+  }
+  function currentOffset() { return Number.isInteger(state.reader.anchorOffset)?state.reader.anchorOffset:((state.reader.offsets||[])[state.reader.currentPage]||0); }
+  function seekToOffset(offset) {
+    var points=state.reader.offsets||[0], page=0;
+    for(var i=1;i<points.length;i++){if(points[i]>offset)break;page=i;}
+    state.reader.currentPage=page; state.reader.anchorOffset=Math.max(0,Math.min(offset,state.reader.text.length)); renderCurrentPage();
   }
   function seekToFraction(f) {
     var n = totalPages();
     var p = Math.round(f * (n - 1));
     state.reader.currentPage = Math.max(0, Math.min(n - 1, p));
+    state.reader.anchorOffset=(state.reader.offsets||[])[state.reader.currentPage]||0;
     renderCurrentPage();
   }
   function scheduleProgressSave() {
@@ -1054,9 +1119,9 @@
   }
   function flushProgress() {
     clearTimeout(state.reader.saveTimer);
-    if (!state.reader.bookId) return;
+    if (!state.reader.bookId || !state.reader.ready || !state.reader.text) return;
     var f = currentFraction();
-    state.data.progress[state.reader.bookId] = { fraction: f, updatedAt: Date.now() };
+    state.data.progress[state.reader.bookId] = { fraction: f, offset:currentOffset(),textLength:state.reader.text.length,anchorVersion:1,updatedAt: Date.now() };
     saveData();
     serverSyncProgress(state.reader.bookId, f);
   }
@@ -1086,6 +1151,7 @@
   }
 
   function bumpTextSize(delta) {
+    var anchor = currentOffset();
     var n = CONFIG.textSizes.length;
     var i = state.data.settings.textSizeIdx + delta;
     if (i < 0 || i >= n) return;
@@ -1093,12 +1159,12 @@
     saveData();
     applyTextSize();
     if (state.currentScreen === 'reader' && state.reader.text) {
-      var f = currentFraction();
       rebuildPages();
-      seekToFraction(f);
+      seekToOffset(anchor); scheduleProgressSave();
     }
   }
   function bumpLineSpacing(delta) {
+    var anchor = currentOffset();
     var n = CONFIG.lineSpacings.length;
     var i = state.data.settings.lineSpacingIdx + delta;
     if (i < 0 || i >= n) return;
@@ -1106,23 +1172,32 @@
     saveData();
     applyTextSize();
     if (state.currentScreen === 'reader' && state.reader.text) {
-      var f = currentFraction();
       rebuildPages();
-      seekToFraction(f);
+      seekToOffset(anchor); scheduleProgressSave();
     }
   }
 
   // ---- Settings screen ----
   function renderSettings() {
     applyTextSize();
-    document.getElementById('settings-device-id').textContent = state.deviceId || '—';
+    document.getElementById('settings-device-id').textContent = 'Reading positions and favorites are saved automatically in this browser. Keep its browsing data to keep access to your shelf.';
     document.getElementById('settings-server-status').textContent =
-      CONFIG.apiBaseUrl
-        ? (state.serverAvailable ? 'Connected (' + CONFIG.apiBaseUrl + ')' : 'Unreachable')
-        : 'Local-only mode';
+      Object.keys(state.data.syncQueue).length ? 'Saved on this device · Waiting to sync.' :
+      state.syncAvailable ? 'Your shelf is also backed up for this browser.' : 'Saved on this device. Online backup is currently unavailable.';
   }
 
   // ==================== ACTIONS ====================
+  function toggleKeyboard() {
+    var keyboard=document.getElementById('search-keyboard'),opening=keyboard.classList.contains('hidden');
+    keyboard.classList.toggle('hidden',!opening);document.getElementById('keyboard-toggle').setAttribute('aria-expanded',opening);
+    document.getElementById('search-results').classList.toggle('hidden',opening);
+    if(opening)focusFirst(keyboard);
+  }
+  function keyboardLetter(key) {
+    var input=document.getElementById('search-input');
+    if(key==='delete')input.value=Array.from(input.value).slice(0,-1).join('');
+    else if(input.value.length<160)input.value+=key==='space'?' ':key.toLowerCase();
+  }
   function handleAction(action, el) {
     switch (action) {
       case 'back':              navigateBack(); break;
@@ -1136,6 +1211,10 @@
       case 'library-tab':       state.libraryTab = el.dataset.tab; renderLibrary(); break;
       case 'open-detail':       openBookDetailFromElement(el); break;
       case 'run-search':        runSearch(); break;
+      case 'toggle-keyboard':   toggleKeyboard(); break;
+      case 'type-letter':       keyboardLetter(el.dataset.letter); break;
+      case 'page-back':         pageBack(); break;
+      case 'page-forward':      pageForward(); break;
       case 'open-book':         openBook(); break;
       case 'retry-open-book':   openBook(); break;
       case 'toggle-favorite':   toggleFavorite(); break;
@@ -1153,13 +1232,19 @@
   function setupEvents() {
     document.addEventListener('click', function (e) {
       var actionEl = e.target.closest('[data-action]');
+      if(!actionEl || !screens[state.currentScreen].contains(actionEl) || actionEl.disabled)return;
+      if(state.currentScreen==='reader' && !isReaderMenuClosed() && !document.getElementById('reader-menu').contains(actionEl))return;
       if (actionEl) handleAction(actionEl.dataset.action, actionEl);
     });
 
     document.addEventListener('keydown', function (e) {
       var active = document.activeElement;
       var isInput = active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA');
-      if (isInput && !['Escape', 'Enter'].includes(e.key)) return;
+      if (isInput && !['Escape', 'Enter','ArrowUp','ArrowDown'].includes(e.key)) return;
+      if(e.key==='Tab' && state.currentScreen==='reader' && !isReaderMenuClosed()) {
+        var choices=visibleFocusables(document.getElementById('reader-menu')),ix=choices.indexOf(active);
+        choices[(ix+(e.shiftKey?-1:1)+choices.length)%choices.length].focus();e.preventDefault();return;
+      }
 
       switch (e.key) {
         case 'ArrowUp':    moveFocus('up');    e.preventDefault(); break;
@@ -1167,6 +1252,7 @@
         case 'ArrowLeft':  moveFocus('left');  e.preventDefault(); break;
         case 'ArrowRight': moveFocus('right'); e.preventDefault(); break;
         case 'Enter':
+          if(e.repeat){e.preventDefault();break;}
           if (isInput) {
             var submit = active.dataset.submitAction;
             if (submit) handleAction(submit, active);
@@ -1189,11 +1275,14 @@
     // Re-paginate on resize (desktop testing)
     window.addEventListener('resize', function () {
       if (state.currentScreen === 'reader' && state.reader.text) {
-        var f = currentFraction();
+        var anchor = currentOffset();
         rebuildPages();
-        seekToFraction(f);
+        seekToOffset(anchor);
       }
     });
+    window.addEventListener('pagehide',function(){flushProgress();saveData();retrySync();});
+    window.addEventListener('online',function(){pingServer();retrySync();hydrateLibrary();});
+    document.addEventListener('visibilitychange',function(){if(document.visibilityState==='hidden')flushProgress();});
   }
 
   // ==================== INIT ====================
@@ -1203,6 +1292,9 @@
     setupEvents();
     loadData();
     applyTextSize();
+    var keyboard=document.getElementById('search-keyboard');
+    'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('').concat(['space','delete']).forEach(function(letter){var b=document.createElement('button');b.className='letter-key focusable';b.dataset.action='type-letter';b.dataset.letter=letter;b.textContent=letter==='space'?'␣':letter==='delete'?'⌫':letter;b.setAttribute('aria-label',letter);keyboard.appendChild(b);});
+    hydrateLibrary().then(retrySync);
     pingServer().then(function () {
       if (state.currentScreen === 'home') renderHome();
       if (state.currentScreen === 'settings') renderSettings();
@@ -1212,10 +1304,11 @@
         state.cache['browse:popular'] = { data: data, timestamp: Date.now() };
       }).catch(function () {});
     });
-    setTimeout(function () {
-      navigateTo('home', { addToHistory: false });
-    }, 50);
+    navigateTo('home', { addToHistory: false });
   }
+
+  window.render_reader_to_text=function(){return JSON.stringify({screen:state.currentScreen,bookId:state.reader.bookId,ready:!!state.reader.ready,page:state.reader.currentPage+1,pages:state.reader.pages.length,offset:currentOffset(),fraction:currentFraction(),focus:document.activeElement&&document.activeElement.getAttribute('data-action')});};
+  if(location.hostname==='127.0.0.1' && new URLSearchParams(location.search).has('test'))window.__readerTest={state:state,open:openBook,action:handleAction,flush:flushProgress,rebuild:rebuildPages,seek:seekToOffset,hydrate:hydrateLibrary,retrySync:retrySync};
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);

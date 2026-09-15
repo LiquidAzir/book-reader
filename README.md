@@ -31,33 +31,36 @@ book-reader/
       schema.sql    users, favorites, reading_history
       migrate.js    Applies schema.sql
 
-  render.yaml       Render Blueprint — provisions static site + API + Postgres
+  render.yaml       Render Blueprint — static site + API using an existing Postgres database
 ```
 
 ### Why a backend?
 
 - **CORS** — gutenberg.org doesn't enable CORS on `.txt` downloads, so the
   glasses can't fetch book content directly. The server proxies and caches.
-- **Public release** — favorites, reading progress, and recents need to survive
-  localStorage clears. Stored server-side, keyed to the anonymous device ID.
-- **Rate limiting** — a single cached fetch per book serves all readers.
+- **Library backup** — favorites, reading progress, and recents are stored
+  server-side under the browser's anonymous identity. Clearing browser storage
+  also clears that identity, so the old library cannot be recovered without it.
+- **Shared content cache** — concurrent readers share a bounded Gutenberg fetch
+  and text cache, reducing repeated upstream requests.
 
 ### Identity model
 
 Each first visit generates a UUID stored at `mdg_book_reader_v1:device`. Every
-API call sends it as `X-Device-Id`. The server upserts a `users` row on first
-sight. To attach an email account later, you can extend the `users` table and
+personal API call sends it as `X-Device-Id`. Public book browsing does not create
+users or require the database. The server upserts a `users` row for personal
+library requests. To attach an email account later, you can extend the `users` table and
 keep the same row.
 
 ## Local dev
 
 ```bash
-# 1. Postgres (any local instance) — optional; the books proxy works without it
+# Use Node 22. Postgres is optional; the books proxy works without it.
 createdb book_reader
 cd server
 cp .env.example .env
 # Edit DATABASE_URL in .env if you want favorites/progress server-side
-npm install
+npm ci
 node src/migrate.js   # if you set DATABASE_URL
 npm run dev           # http://localhost:3000
 
@@ -67,18 +70,20 @@ python -m http.server 5180
 # Open http://localhost:5180/ — config.js auto-points to localhost:3000
 ```
 
-Arrow keys = D-pad. Enter = tap. Escape = back. In the reader, ←/→ turn pages
-and ↑/↓ open the size menu.
+Arrow keys = D-pad. Enter or focused click = pinch. Escape = back. In the reader,
+←/→ turn pages, ↑ focuses the toolbar, and ↓ opens the reading menu. Touch
+Previous/Next buttons also turn pages. See [reader controls and save behavior](glasses-app/README.md).
 
 ## Deploying to Render
 
-The included [`render.yaml`](./render.yaml) provisions everything in one click.
+The included [`render.yaml`](./render.yaml) defines the static site and API.
+It uses a separately configured Postgres connection, such as the existing Neon database.
 
 1. Push this repo to GitHub.
 2. In Render: **Blueprints → New Blueprint Instance**, select the repo.
-3. Render creates: a Postgres DB, the API service, and the static site.
-   `node src/migrate.js` runs as part of the API build, so the schema is
-   applied automatically on first deploy.
+3. Supply the existing database connection as `DATABASE_URL`. Render creates the
+   API service and static site. `npm ci && node src/migrate.js` installs the
+   committed dependencies and applies the idempotent schema during the API build.
 4. After the static site deploys, copy its URL and:
    - Edit [`glasses-app/config.js`](./glasses-app/config.js) — replace
      `PROD_API_URL` with your actual API URL (e.g.
@@ -86,9 +91,9 @@ The included [`render.yaml`](./render.yaml) provisions everything in one click.
    - In the API service settings, set `CORS_ORIGINS` to the static site URL
      (instead of `*`) for production.
 
-The free tier puts the API to sleep after 15 minutes of inactivity. First
-request after sleep takes ~30s to wake. Upgrade the API service plan to
-prevent sleep if needed.
+If the hosting plan puts an idle API to sleep, its first request can take longer
+to complete. The reader keeps its local library and saved place during temporary
+service failures and retries pending personal saves on later visits.
 
 ## Adding to your glasses
 

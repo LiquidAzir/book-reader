@@ -2,7 +2,8 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=600, height=600, initial-scale=1.0, user-scalable=no">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="mrbd-web-app-capable" content="yes">
   <title>Book Reader</title>
   <link rel="icon" type="image/png" href="favicon.png">
   <link rel="manifest" href="manifest.webmanifest">
@@ -14,24 +15,27 @@
     <!-- ============ HOME ============ -->
     <div id="home" class="screen">
       <header class="header">
-        <h1>Book Reader</h1>
+        <span class="brand-mark" aria-hidden="true">❧</span><h1>Book Reader</h1>
         <span class="header-meta" id="home-status"></span>
       </header>
       <div class="content">
+        <div class="library-welcome" id="library-welcome"><span class="eyebrow">THE EVERYDAY LIBRARY</span><h2>Your next chapter,<br>wherever you are.</h2><p>Remarkable stories. A moment of your own.</p></div>
         <div id="continue-reading-card" class="continue-card hidden">
           <div class="continue-label">Continue reading</div>
           <div class="continue-title" id="continue-title"></div>
           <div class="continue-author" id="continue-author"></div>
+          <span id="continue-percent" class="continue-percent"></span>
           <div class="progress-bar"><div class="progress-fill" id="continue-progress"></div></div>
           <button class="nav-item primary focusable" data-action="resume-reading">Resume</button>
         </div>
+        <div id="home-featured" class="featured-shelf" aria-label="Featured classics"></div>
         <div class="help-card">
-          <div class="help-title">Controls</div>
+          <div class="help-title">Settle into a story</div>
           <div class="help-grid">
             <div class="help-key">← →</div><div class="help-desc">Turn pages while reading</div>
             <div class="help-key">↑</div><div class="help-desc">Back button &amp; toolbar</div>
             <div class="help-key">↓</div><div class="help-desc">Open text-size menu</div>
-            <div class="help-key">Tap</div><div class="help-desc">Select focused item</div>
+            <div class="help-key">Pinch</div><div class="help-desc">Select · Enter or touch also works</div>
           </div>
         </div>
       </div>
@@ -70,13 +74,14 @@
       <div class="content">
         <input
           id="search-input"
-          class="text-input focusable"
+           class="text-input focusable"
           type="text"
           placeholder="Title or author..."
           data-submit-action="run-search"
-          autocomplete="off"
+           autocomplete="off" aria-label="Search by title or author" enterkeyhint="search"
         />
-        <button class="nav-item primary focusable" data-action="run-search">Search</button>
+        <div class="search-tools"><button class="nav-item primary focusable" data-action="run-search">Find books</button><button class="nav-item focusable" data-action="toggle-keyboard" aria-expanded="false" id="keyboard-toggle">Spell with D-pad</button></div>
+        <div id="search-keyboard" class="search-keyboard hidden" aria-label="Letter keyboard"></div>
         <div id="search-results" class="list-container"></div>
       </div>
     </div>
@@ -85,13 +90,14 @@
     <div id="book-detail" class="screen hidden">
       <header class="header">
         <button class="back-btn focusable" data-action="back">&#8592;</button>
-        <h1 id="detail-title">Book</h1>
+        <h1 id="detail-title">Inside the cover</h1>
       </header>
       <div class="content">
-        <div class="detail-meta">
+        <div class="detail-hero"><div id="detail-cover" aria-hidden="true"></div><div class="detail-meta">
+          <span class="eyebrow">PROJECT GUTENBERG</span><h2 id="detail-name"></h2>
           <div class="detail-author" id="detail-author"></div>
           <div class="detail-subjects" id="detail-subjects"></div>
-        </div>
+        </div></div>
         <div class="detail-actions">
           <button class="nav-item primary focusable" data-action="open-book">Read</button>
           <button class="nav-item focusable" data-action="toggle-favorite" id="detail-favorite-btn">Favorite</button>
@@ -103,18 +109,20 @@
     <!-- ============ READER ============ -->
     <div id="reader" class="screen hidden">
       <div class="reader-toolbar" id="reader-toolbar">
-        <button class="back-btn focusable" data-action="back">&#8592;</button>
+        <button class="back-btn focusable" data-action="back" aria-label="Leave reader">&#8592;</button>
         <div class="reader-toolbar-title" id="reader-toolbar-title"></div>
-        <button class="reader-toolbar-btn focusable" data-action="open-reader-menu">&#9776;</button>
+        <button class="reader-toolbar-btn focusable" data-action="open-reader-menu" aria-label="Reading menu">Aa · Menu</button>
       </div>
-      <div class="reader-page" id="reader-page">
+      <div class="reader-page focusable" id="reader-page" tabindex="0" role="document" data-action="open-reader-menu" aria-label="Book text. Left and right turn pages. Pinch or Enter opens reading menu.">
         <div class="reader-page-inner" id="reader-page-inner"></div>
       </div>
       <div class="reader-footer" id="reader-footer">
-        <span id="reader-page-num">—</span>
+        <button class="reader-turn focusable" data-action="page-back" id="page-back" aria-label="Previous page">← Previous</button><span id="reader-page-num">—</span><button class="reader-turn focusable" data-action="page-forward" id="page-forward" aria-label="Next page">Next →</button>
       </div>
+      <div class="reading-track" aria-hidden="true"><div id="reading-track-fill"></div></div>
 
-      <div class="reader-menu hidden focusable" id="reader-menu" tabindex="-1">
+      <div class="reader-menu hidden" id="reader-menu" role="dialog" aria-modal="true" aria-labelledby="reader-menu-title">
+        <span class="eyebrow">MAKE YOURSELF COMFORTABLE</span><h2 id="reader-menu-title">Reading menu</h2>
         <div class="reader-menu-row">
           <span class="reader-menu-label">Text size</span>
           <div class="reader-menu-controls">
@@ -123,7 +131,10 @@
             <button class="reader-menu-btn focusable" data-action="text-size-up">A+</button>
           </div>
         </div>
-        <button class="nav-item focusable" data-action="close-reader-menu">Close</button>
+        <div class="reader-menu-row"><span class="reader-menu-label">Line spacing</span><div class="reader-menu-controls"><button class="reader-menu-btn focusable" data-action="line-spacing-down" aria-label="Decrease line spacing">−</button><span id="reader-spacing-display" class="reader-menu-value"></span><button class="reader-menu-btn focusable" data-action="line-spacing-up" aria-label="Increase line spacing">+</button></div></div>
+        <p class="reader-menu-tip">← → turn pages · ↑ toolbar · ↓ this menu<br>Your place is saved automatically.</p>
+        <button class="nav-item primary focusable" data-action="close-reader-menu">Back to reading</button>
+        <button class="nav-item focusable" data-action="back">Leave book</button>
       </div>
     </div>
 
@@ -166,11 +177,11 @@
           </div>
         </div>
         <div class="settings-meta">
-          <div class="settings-meta-label">Device ID</div>
+          <div class="settings-meta-label">Your reading place</div>
           <div class="settings-meta-value" id="settings-device-id">—</div>
         </div>
         <div class="settings-meta">
-          <div class="settings-meta-label">Server</div>
+          <div class="settings-meta-label">Library backup</div>
           <div class="settings-meta-value" id="settings-server-status">—</div>
         </div>
       </div>

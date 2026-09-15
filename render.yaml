@@ -11,12 +11,12 @@ services:
     runtime: node
     plan: free
     rootDir: server
-    buildCommand: npm install && node src/migrate.js
+    buildCommand: npm ci && node src/migrate.js
     startCommand: node src/index.js
     healthCheckPath: /api/health
     envVars:
       - key: NODE_VERSION
-        value: 20
+        value: 22
       - key: DATABASE_URL
         # Neon Postgres connection URL. KEEP the ?sslmode=require query param:
         # src/db.js only forces TLS for render.com hosts, so for Neon the URL
@@ -38,6 +38,9 @@ services:
     buildCommand: ""
     staticPublishPath: .
     headers:
+      - path: /*
+        name: Cache-Control
+        value: public, max-age=0, must-revalidate
       - path: /*
         name: X-Frame-Options
         value: SAMEORIGIN

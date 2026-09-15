@@ -3,8 +3,7 @@ const { pool } = require('../db');
 const DEVICE_ID_RE = /^dev_[A-Za-z0-9-]{8,128}$/;
 
 // Identifies the caller by X-Device-Id header. Lazy-creates a users row on first sight.
-// Routes that need an identified caller use `requireUser`; routes that are open
-// (e.g. browse) use the lighter `attachUser` which doesn't 401.
+// Only personal-library routes need this database lookup. Browsing stays public.
 async function attachUser(req, res, next) {
   const id = req.header('X-Device-Id');
   if (!id || !DEVICE_ID_RE.test(id)) {
@@ -22,9 +21,9 @@ async function attachUser(req, res, next) {
     req.user = rows[0];
     next();
   } catch (err) {
-    console.error('[device] upsert failed:', err.message);
+    console.error('[device] library unavailable:', err.code || err.name);
     req.user = null;
-    next();
+    res.set('Retry-After', '10').status(503).json({ error: 'Library temporarily unavailable. Your device identity is unchanged.' });
   }
 }
 

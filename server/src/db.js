@@ -12,11 +12,13 @@ const pool = new Pool({
     ? { rejectUnauthorized: false }
     : undefined,
   max: 10,
+  connectionTimeoutMillis: 5000,
+  query_timeout: 10000,
   idleTimeoutMillis: 30_000,
 });
 
 pool.on('error', (err) => {
-  console.error('[db] Unexpected pool error', err);
+  console.error('[db] Unexpected pool error', err.code || err.name);
 });
 
 module.exports = { pool };

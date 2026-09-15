@@ -1,157 +1,108 @@
 const express = require('express');
-
+const { bookIdParam } = require('../http');
+const { bookUrl, bookRedirectUrl, catalogUrl, boundedInt, readUpstream, UpstreamError } = require('../upstream');
 const router = express.Router();
-
-const GUTENDEX = 'https://gutendex.com';
-const MAX_ENTRIES = Number(process.env.BOOK_CACHE_MAX_ENTRIES || 50);
-// Gutendex list queries can take 15-20s under load. Allow up to 20s before
-// we give up; the frontend uses a bundled fallback when Browse times out.
-const FETCH_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS || 20000);
-const METADATA_CACHE_TTL_MS = 1000 * 60 * 60; // 1 hour
-const LIST_CACHE_TTL_MS = 1000 * 60 * 10;     // 10 minutes
-
-// Aborts the upstream fetch after FETCH_TIMEOUT_MS so a slow/down Gutendex
-// can't pin a request handler indefinitely.
-async function fetchWithTimeout(url, opts = {}) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), opts.timeoutMs || FETCH_TIMEOUT_MS);
-  try {
-    return await fetch(url, { ...opts, signal: controller.signal });
-  } finally {
-    clearTimeout(timer);
-  }
+const TIMEOUT = boundedInt(process.env.UPSTREAM_TIMEOUT_MS, 20000, 100, 30000);
+const MAX_ENTRIES = boundedInt(process.env.BOOK_CACHE_MAX_ENTRIES, 50, 1, 100);
+const MAX_TEXT_BYTES = boundedInt(process.env.BOOK_CACHE_MAX_BYTES, 32 * 1024 * 1024, 1024 * 1024, 64 * 1024 * 1024);
+const jsonCache = new Map(), textCache = new Map(), inFlight = new Map();
+function hit(map, key) {
+  const value = map.get(key);
+  if (value) { map.delete(key); map.set(key, value); }
+  return value;
 }
-
-// LRU cache for full book text (large). Keyed by bookId.
-const textCache = new Map();
-function lruGet(map, key) {
-  if (!map.has(key)) return null;
-  const v = map.get(key);
+function put(map, key, data, cap, byteCap) {
+  const bytes = Buffer.byteLength(typeof data === 'string' ? data : JSON.stringify(data));
   map.delete(key);
-  map.set(key, v);
-  return v;
-}
-function lruSet(map, key, value, cap) {
-  map.set(key, value);
-  while (map.size > cap) map.delete(map.keys().next().value);
-}
-
-// In-memory cache for Gutendex JSON responses (list + detail). When Gutendex
-// is down, we can serve stale entries so Browse still shows something.
-const jsonCache = new Map(); // key -> { data, fetchedAt }
-async function cachedJson(key, url, ttl) {
-  const hit = lruGet(jsonCache, key);
-  if (hit && Date.now() - hit.fetchedAt < ttl) {
-    return { data: hit.data, fresh: true };
+  if (bytes > byteCap) return;
+  map.set(key, { data, bytes, at: Date.now() });
+  let total = [...map.values()].reduce((sum, item) => sum + item.bytes, 0);
+  while (map.size > cap || total > byteCap) {
+    const first = map.keys().next().value; total -= map.get(first).bytes; map.delete(first);
   }
+}
+function once(key, work) {
+  if (inFlight.has(key)) return inFlight.get(key);
+  if (inFlight.size >= 12) return Promise.reject(new UpstreamError('Book service is busy. Please try again.'));
+  const pending = Promise.resolve().then(work).finally(() => inFlight.delete(key));
+  inFlight.set(key, pending); return pending;
+}
+async function catalog(key, url, ttl) {
+  const cached = hit(jsonCache, key);
+  if (cached && Date.now() - cached.at < ttl) return { data: cached.data, fresh: true };
   try {
-    const r = await fetchWithTimeout(url);
-    if (!r.ok) throw new Error('upstream ' + r.status);
-    const data = await r.json();
-    lruSet(jsonCache, key, { data, fetchedAt: Date.now() }, 200);
-    return { data, fresh: true };
+    return await once(key, async () => {
+      const response = await readUpstream(url, { validate: catalogUrl, timeoutMs: TIMEOUT, maxBytes: 2 * 1024 * 1024 });
+      let data; try { data = JSON.parse(response.text); } catch { throw new UpstreamError('Invalid catalog response', 502); }
+      if (!data || typeof data !== 'object' || (key.startsWith('list:') ? !Array.isArray(data.results) : typeof data.formats !== 'object' || !data.formats)) throw new UpstreamError('Invalid catalog response', 502);
+      put(jsonCache, key, data, 200, 8 * 1024 * 1024);
+      return { data, fresh: true };
+    });
   } catch (err) {
-    if (hit) return { data: hit.data, fresh: false, error: err.message };
+    if (cached && err.status !== 404) return { data: cached.data, fresh: false };
     throw err;
   }
 }
+async function bookText(raw) {
+  const url = bookRedirectUrl(raw).toString(), cached = hit(textCache, url);
+  if (cached) return cached.data;
+  return once('text:' + url, async () => {
+    const response = await readUpstream(url, { timeoutMs: TIMEOUT, validateRedirect: bookRedirectUrl });
+    if (!response.text.trim() || /(?:text\/html|application\/(?:json|xml))/i.test(response.contentType) || /^\s*(?:<!doctype html|<html)/i.test(response.text)) throw new UpstreamError('No readable text edition returned', 502);
+    put(textCache, url, response.text, MAX_ENTRIES, MAX_TEXT_BYTES);
+    return response.text;
+  });
+}
+function failure(res, err, fallback) {
+  const status = err instanceof UpstreamError ? err.status : 503;
+  if (status === 503) res.set('Retry-After', '10');
+  res.set('Cache-Control', 'no-store').status(status).json({ error: status === 404 ? 'Book not found' : status === 413 ? 'This text edition is too large to load.' : fallback });
+}
+function sendText(res, text) { res.set('Cache-Control', 'public, max-age=86400').type('text/plain; charset=utf-8').send(text); }
 
-// Proxy Gutendex search/browse with server-side caching + timeout so a slow
-// upstream doesn't translate to slow Browse.
 router.get('/books', async (req, res) => {
-  const qs = new URLSearchParams(req.query).toString();
-  const key = 'list:' + qs;
+  const allowed = new Set(['search', 'topic', 'page', 'languages', 'mime_type', 'sort', 'ids', 'copyright', 'author_year_start', 'author_year_end']);
+  const query = new URLSearchParams();
+  for (const key of Object.keys(req.query).sort()) {
+    const value = req.query[key];
+    if (!allowed.has(key) || typeof value !== 'string' || value.length > 1000 || (key === 'page' && !/^[1-9]\d{0,5}$/.test(value))) return res.status(400).json({ error: 'Invalid catalog query' });
+    query.set(key, value);
+  }
   try {
-    const { data, fresh } = await cachedJson(key, GUTENDEX + '/books?' + qs, LIST_CACHE_TTL_MS);
+    const { data, fresh } = await catalog('list:' + query, 'https://gutendex.com/books?' + query, 600000);
     res.set('Cache-Control', fresh ? 'public, max-age=300' : 'public, max-age=60');
     if (!fresh) res.set('X-Cache-Status', 'stale');
     res.json(data);
-  } catch (err) {
-    console.error('[books] list failed:', err.message);
-    res.status(503).json({ error: 'Catalog temporarily unavailable. Try again in a moment.' });
-  }
+  } catch (err) { failure(res, err, 'Catalog temporarily unavailable. Try again in a moment.'); }
 });
-
-router.get('/books/:id', async (req, res) => {
-  const id = String(req.params.id);
+router.get('/proxy', async (req, res) => {
+  let url;
   try {
-    const { data, fresh } = await cachedJson(
-      'detail:' + id,
-      GUTENDEX + '/books/' + encodeURIComponent(id),
-      METADATA_CACHE_TTL_MS
-    );
+    if (typeof req.query.url !== 'string' || req.query.url.length > 2048) return res.status(400).json({ error: 'Invalid book URL' });
+    url = bookUrl(req.query.url);
+  } catch { return res.status(403).json({ error: 'Book host not allowed' }); }
+  try { sendText(res, await bookText(url.toString())); }
+  catch (err) { failure(res, err, 'Book content temporarily unavailable. Try again in a moment.'); }
+});
+router.get('/books/:id', async (req, res) => {
+  const id = bookIdParam(req.params.id);
+  if (!id) return res.status(400).json({ error: 'Invalid book ID' });
+  try {
+    const { data, fresh } = await catalog('detail:' + id, 'https://gutendex.com/books/' + id, 3600000);
     res.set('Cache-Control', fresh ? 'public, max-age=3600' : 'public, max-age=300');
     if (!fresh) res.set('X-Cache-Status', 'stale');
     res.json(data);
-  } catch (err) {
-    console.error('[books] detail failed:', err.message);
-    res.status(503).json({ error: 'Book metadata temporarily unavailable.' });
-  }
+  } catch (err) { failure(res, err, 'Book metadata temporarily unavailable.'); }
 });
-
-// Allow-listed proxy for direct Gutenberg .txt URLs. Used by the frontend's
-// fallback path when the catalog API is unreachable but we know the canonical
-// URL ahead of time (from the bundled fallback catalog).
-const ALLOWED_PROXY_HOSTS = new Set([
-  'www.gutenberg.org',
-  'gutenberg.org',
-  'www.gutenberg.net',
-]);
-router.get('/proxy', async (req, res) => {
-  const raw = String(req.query.url || '');
-  let url;
-  try { url = new URL(raw); }
-  catch { return res.status(400).json({ error: 'bad url' }); }
-  if (url.protocol !== 'https:' || !ALLOWED_PROXY_HOSTS.has(url.hostname)) {
-    return res.status(403).json({ error: 'host not allowed' });
-  }
-  try {
-    const r = await fetchWithTimeout(url.toString(), { timeoutMs: 20_000 });
-    if (!r.ok) return res.status(r.status).json({ error: 'upstream ' + r.status });
-    const text = await r.text();
-    res.set('Cache-Control', 'public, max-age=86400');
-    res.type('text/plain; charset=utf-8').send(text);
-  } catch (err) {
-    console.error('[proxy] failed:', err.message);
-    res.status(503).json({ error: 'Upstream fetch failed' });
-  }
-});
-
 router.get('/books/:id/content', async (req, res) => {
-  const id = String(req.params.id);
-  const cached = lruGet(textCache, id);
-  if (cached) {
-    res.set('Cache-Control', 'public, max-age=86400');
-    res.type('text/plain; charset=utf-8').send(cached.text);
-    return;
-  }
+  const id = bookIdParam(req.params.id);
+  if (!id) return res.status(400).json({ error: 'Invalid book ID' });
   try {
-    // Need metadata to find the plain-text format URL. Use cached metadata if available.
-    const { data: meta } = await cachedJson(
-      'detail:' + id,
-      GUTENDEX + '/books/' + encodeURIComponent(id),
-      METADATA_CACHE_TTL_MS
-    );
-    const fmts = (meta && meta.formats) || {};
-    const finalUrl =
-      fmts['text/plain; charset=utf-8'] ||
-      fmts['text/plain'] ||
-      fmts['text/plain; charset=us-ascii'] ||
-      Object.entries(fmts).find(([k, v]) => k.startsWith('text/plain') && v)?.[1];
-    if (!finalUrl) {
-      return res.status(404).json({ error: 'No plain-text edition available for this book' });
-    }
-    // Book text downloads can be 500KB+, give them a longer timeout.
-    const r = await fetchWithTimeout(finalUrl, { timeoutMs: 20_000 });
-    if (!r.ok) return res.status(r.status).json({ error: 'Failed to fetch book content' });
-    const text = await r.text();
-    lruSet(textCache, id, { text, fetchedAt: Date.now() }, MAX_ENTRIES);
-    res.set('Cache-Control', 'public, max-age=86400');
-    res.type('text/plain; charset=utf-8').send(text);
-  } catch (err) {
-    console.error('[books] content failed:', err.message);
-    res.status(503).json({ error: 'Book content temporarily unavailable. Try again in a moment.' });
-  }
+    const { data } = await catalog('detail:' + id, 'https://gutendex.com/books/' + id, 3600000);
+    const formats = data.formats;
+    const url = formats['text/plain; charset=utf-8'] || formats['text/plain'] || formats['text/plain; charset=us-ascii'] || Object.entries(formats).find(([type, value]) => type.startsWith('text/plain') && value)?.[1];
+    if (!url) return res.status(404).json({ error: 'No plain-text edition available for this book' });
+    sendText(res, await bookText(url));
+  } catch (err) { failure(res, err, 'Book content temporarily unavailable. Try again in a moment.'); }
 });
-
 module.exports = router;
