@@ -1,11 +1,13 @@
 const express = require('express');
 const { bookIdParam } = require('../http');
 const { bookUrl, bookRedirectUrl, catalogUrl, boundedInt, readUpstream, UpstreamError } = require('../upstream');
+const savedCatalog = require('../catalog');
 const router = express.Router();
 const TIMEOUT = boundedInt(process.env.UPSTREAM_TIMEOUT_MS, 20000, 100, 30000);
 const MAX_ENTRIES = boundedInt(process.env.BOOK_CACHE_MAX_ENTRIES, 50, 1, 100);
 const MAX_TEXT_BYTES = boundedInt(process.env.BOOK_CACHE_MAX_BYTES, 32 * 1024 * 1024, 1024 * 1024, 64 * 1024 * 1024);
 const jsonCache = new Map(), textCache = new Map(), inFlight = new Map();
+let catalogRetryAt = 0;
 function hit(map, key) {
   const value = map.get(key);
   if (value) { map.delete(key); map.set(key, value); }
@@ -31,6 +33,7 @@ async function catalog(key, url, ttl) {
   const cached = hit(jsonCache, key);
   if (cached && Date.now() - cached.at < ttl) return { data: cached.data, fresh: true };
   try {
+    if (Date.now() < catalogRetryAt) throw new UpstreamError('Catalog relay temporarily unavailable');
     return await once(key, async () => {
       const response = await readUpstream(url, { validate: catalogUrl, timeoutMs: TIMEOUT, maxBytes: 2 * 1024 * 1024 });
       let data; try { data = JSON.parse(response.text); } catch { throw new UpstreamError('Invalid catalog response', 502); }
@@ -39,7 +42,16 @@ async function catalog(key, url, ttl) {
       return { data, fresh: true };
     });
   } catch (err) {
+    // Gutendex may refuse datacenter traffic. Respect that response and use
+    // Gutenberg's expressly published offline catalog instead of relaying around it.
+    if (err.code === 'UPSTREAM_HTTP_403') {
+      catalogRetryAt = Date.now() + 10 * 60 * 1000;
+      console.warn('[book-upstream]', err.code, 'using published Gutenberg catalog');
+    }
     if (cached && err.status !== 404) return { data: cached.data, fresh: false };
+    const data = key.startsWith('list:') ? savedCatalog.list(new URL(url).searchParams) : savedCatalog.detail(Number(key.slice('detail:'.length)));
+    if (data) return { data, fresh: false, source: 'gutenberg-offline' };
+    if (Date.now() < catalogRetryAt) throw new UpstreamError('Book not found in saved catalog', 404);
     throw err;
   }
 }
@@ -54,11 +66,11 @@ async function bookText(raw) {
   });
 }
 function failure(res, err, fallback) {
-  const status = err instanceof UpstreamError ? err.status : 503;
+  const status = err instanceof UpstreamError ? err.status : err instanceof savedCatalog.CatalogQueryError ? 400 : 503;
   // Operational diagnostics contain only error codes, never URLs, book text or identity.
   console.warn('[book-upstream]', err.code || err.cause?.code || err.name || 'Error', status);
   if (status === 503) res.set('Retry-After', '10');
-  res.set('Cache-Control', 'no-store').status(status).json({ error: status === 404 ? 'Book not found' : status === 413 ? 'This text edition is too large to load.' : fallback });
+  res.set('Cache-Control', 'no-store').status(status).json({ error: status === 404 ? 'Book not found' : status === 413 ? 'This text edition is too large to load.' : status === 400 ? 'This filter is not available in the saved catalog.' : fallback });
 }
 function sendText(res, text) { res.set('Cache-Control', 'public, max-age=86400').type('text/plain; charset=utf-8').send(text); }
 
@@ -71,9 +83,10 @@ router.get('/books', async (req, res) => {
     query.set(key, value);
   }
   try {
-    const { data, fresh } = await catalog('list:' + query, 'https://gutendex.com/books?' + query, 600000);
+    const { data, fresh, source } = await catalog('list:' + query, 'https://gutendex.com/books?' + query, 600000);
     res.set('Cache-Control', fresh ? 'public, max-age=300' : 'public, max-age=60');
     if (!fresh) res.set('X-Cache-Status', 'stale');
+    if (source) res.set('X-Catalog-Source', source);
     res.json(data);
   } catch (err) { failure(res, err, 'Catalog temporarily unavailable. Try again in a moment.'); }
 });
@@ -90,8 +103,9 @@ router.get('/books/:id', async (req, res) => {
   const id = bookIdParam(req.params.id);
   if (!id) return res.status(400).json({ error: 'Invalid book ID' });
   try {
-    const { data, fresh } = await catalog('detail:' + id, 'https://gutendex.com/books/' + id, 3600000);
+    const { data, fresh, source } = await catalog('detail:' + id, 'https://gutendex.com/books/' + id, 3600000);
     res.set('Cache-Control', fresh ? 'public, max-age=3600' : 'public, max-age=300');
+    if (source) res.set('X-Catalog-Source', source);
     if (!fresh) res.set('X-Cache-Status', 'stale');
     res.json(data);
   } catch (err) { failure(res, err, 'Book metadata temporarily unavailable.'); }

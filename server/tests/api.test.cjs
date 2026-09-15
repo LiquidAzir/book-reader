@@ -129,6 +129,21 @@ test('Book Reader API regressions (isolated database and upstream)', async t => 
         assert.ok(Date.now() - started < 700);
       } finally { slow.closeAllConnections(); await new Promise(resolve => slow.close(resolve)); }
     });
+    await t.test('datacenter refusal falls back to the official catalog with one bounded retry circuit', async () => {
+      let catalogCalls = 0, textCalls = 0;
+      global.fetch = async url => {
+        if (new URL(url).hostname === 'gutendex.com') { catalogCalls++; return new Response('Denied', { status: 403 }); }
+        textCalls++; return new Response('Official book text fixture', { headers: { 'Content-Type': 'text/plain' } });
+      };
+      const search = await request('/api/books?search=pride%20prejudice&languages=en');
+      assert.equal(search.status, 200); assert.equal(search.headers.get('x-catalog-source'), 'gutenberg-offline');
+      const data = await search.json(); assert.equal(data.catalog_source, 'gutenberg-offline'); assert.ok(data.results.some(book => book.id === 1342));
+      const detail = await request('/api/books/1342'); assert.equal(detail.status, 200); assert.equal((await detail.json()).copyright, null);
+      const content = await request('/api/books/1342/content'); assert.equal(content.status, 200); assert.equal(await content.text(), 'Official book text fixture');
+      assert.equal((await request('/api/books?copyright=false')).status, 400);
+      assert.equal((await request('/api/books/2147483647')).status, 404);
+      assert.equal(catalogCalls, 1); assert.equal(textCalls, 1);
+    });
   } finally {
     global.fetch = originalFetch; pool.query = originalQuery;
     server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); await pool.end();

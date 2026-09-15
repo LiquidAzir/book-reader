@@ -622,8 +622,8 @@
 
   // ---- Browse ----
   // Tabs split into two strategies:
-  //   - "popular" hits the live Gutendex catalog (fast, ~1s) so users see the
-  //     freshest most-downloaded books from the full 78K set.
+  //   - "popular" uses the server catalog. It may return a dated Gutenberg
+  //     backup, which is labeled as Catalog rather than live popularity.
   //   - Topic tabs (fiction / adventure / mystery) render from the bundled
   //     catalog directly. Gutendex topic-filtered queries take 15-22s which is
   //     unusable on glasses; the curated bundled list is instant and reliable.
@@ -660,7 +660,7 @@
       return;
     }
 
-    // Popular tab → live Gutendex page 1.
+    // Default catalog page; the response identifies any saved catalog source.
     list.innerHTML = '<div class="loading-row">Loading…</div>';
     var cacheKey = 'browse:popular';
     var cached = state.cache[cacheKey];
@@ -718,8 +718,28 @@
     ex.gutendexPage = 1;
     ex.hasMore = !!data.next;
     renderBookList('browse-list', books, { emptyMessage: 'No books in this category' });
+    showCatalogSource('browse-list', data);
+    document.querySelector('#browse-tabs [data-tab="popular"]').textContent = data.catalog_source === 'gutenberg-offline' ? 'Catalog' : 'Popular';
     updateLoadMoreButton();
     if(restore)focusFirst(screens.browse);
+  }
+
+  function showCatalogSource(listId, data) {
+    if (data.catalog_source !== 'gutenberg-offline') return;
+    var list = document.getElementById(listId);
+    var note = list.querySelector('.catalog-source-note');
+    if (!note) {
+      note = document.createElement('p');
+      note.className = 'book-item-meta catalog-source-note';
+      note.style.gridColumn = '1 / -1';
+      note.style.margin = '0 0 4px';
+      note.style.fontSize = '14px';
+      note.style.lineHeight = '1.4';
+      note.setAttribute('role', 'status');
+      list.insertBefore(note, list.firstChild);
+    }
+    var date = typeof data.catalog_date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(data.catalog_date) ? data.catalog_date : '';
+    note.textContent = 'Gutenberg catalog · ' + (date ? 'saved ' + date : 'saved edition');
   }
 
   function updateLoadMoreButton(errorMsg) {
@@ -772,6 +792,8 @@
         });
       fresh.forEach(function (b) { ex.loadedIds[b.id] = true; });
       appendBooksToList('browse-list', fresh);
+      showCatalogSource('browse-list', data);
+      if (tab === 'popular' && data.catalog_source === 'gutenberg-offline') document.querySelector('#browse-tabs [data-tab="popular"]').textContent = 'Catalog';
       ex.gutendexPage += 1;
       ex.hasMore = !!data.next;
       ex.loadingMore = false;
@@ -810,6 +832,7 @@
       if(generation!==searchGeneration)return;
       var books = (data.results || []).map(normalizeGutendexBook);
       renderBookList('search-results', books, { emptyMessage: 'No results' });
+      showCatalogSource('search-results', data);
     }).catch(function (err) {
       if(generation!==searchGeneration)return;
       var fallback = window.__BOOK_READER_FALLBACK_CATALOG__;

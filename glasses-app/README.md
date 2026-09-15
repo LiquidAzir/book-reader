@@ -2,6 +2,8 @@
 
 This frontend stays dependency-free and works at the Meta Display's 600×600 viewport and in native phone layouts. Covers use static CSS, and the reader keeps only one displayed page in the DOM.
 
+When the server uses its saved official Gutenberg catalog, browse and search show the catalog's snapshot date. The default tab reads **Catalog** for those results, rather than implying current popularity. Pagination supports the server's relative next-page links while keeping the original search or category query.
+
 ## Controls
 
 - Library: arrows move between books, tabs and actions. Enter or a click on the focused element activates it. Touch also works.

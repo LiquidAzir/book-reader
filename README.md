@@ -43,6 +43,11 @@ book-reader/
   also clears that identity, so the old library cannot be recovered without it.
 - **Shared content cache** — concurrent readers share a bounded Gutenberg fetch
   and text cache, reducing repeated upstream requests.
+- **Catalog resilience** — if Gutendex is unavailable, the API searches the
+  official Gutenberg offline snapshot bundled on the server. The app shows its
+  saved date. This index includes 78,130 text editions; it does not add a large
+  download to the glasses. It records unknown copyright/download counts as
+  unknown and labels its curated ordering instead of claiming live popularity.
 
 ### Identity model
 
