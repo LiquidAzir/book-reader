@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Open book with gold bookmark">
+  <defs>
+    <linearGradient id="books-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#26555C"/>
+      <stop offset="1" stop-color="#0A1C2B"/>
+    </linearGradient>
+    <linearGradient id="books-paper" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#FFFAE8"/>
+      <stop offset="1" stop-color="#E7D9B6"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="url(#books-bg)"/>
+  <path d="M22 36c15-5 29-3 42 4 13-7 27-9 42-4v63c-15-5-29-3-42 4-13-7-27-9-42-4Z" fill="#05141F" opacity=".5"/>
+  <path d="M22 31c15-5 29-3 42 4 13-7 27-9 42-4v63c-15-5-29-3-42 4-13-7-27-9-42-4Z" fill="#BC9651"/>
+  <path d="M26 28c14-3 26-1 38 6 12-7 24-9 38-6v61c-14-3-26-1-38 6-12-7-24-9-38-6Z" fill="url(#books-paper)"/>
+  <path d="M64 34c12-7 24-9 38-6v61c-14-3-26-1-38 6Z" fill="#E5D7B3"/>
+  <path d="M62 34h4v60l-2 1-2-1Z" fill="#B6985C"/>
+  <path d="M34 44c6 0 12 1 18 4m-18 8c6 0 12 1 18 4m-18 8c6 0 12 1 18 4" fill="none" stroke="#B7AD93" stroke-width="3" stroke-linecap="round"/>
+  <path d="M76 49c5-2 10-3 17-3m-17 15c5-2 10-3 17-3m-17 15c5-2 10-3 17-3" fill="none" stroke="#B1A481" stroke-width="3" stroke-linecap="round"/>
+  <path d="M77 30c4-1 8-2 13-2v28l-6-4-7 6Z" fill="#C09541"/>
+  <path d="M77 30c2-1 4-1 6-1v24l-6 5Z" fill="#E8C775"/>
+</svg>
