@@ -1,4 +1,4 @@
-const{chromium}=require(process.env.PLAYWRIGHT_MODULE||'C:/Users/kgood/.codex/skills/develop-web-game/node_modules/playwright'),{books,text,route}=require('./frontend-fixture.cjs'),assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path');
+const{chromium}=require(process.env.PLAYWRIGHT_MODULE||require('node:path').join(require('node:os').homedir(),'.codex/skills/develop-web-game/node_modules/playwright')),{books,text,route}=require('./frontend-fixture.cjs'),assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path');
 const OUT=process.env.BOOK_EVIDENCE||path.resolve(__dirname,'../../.visual-review/next-trio/books/tests');fs.mkdirSync(OUT,{recursive:true});
 (async()=>{const browser=await chromium.launch({headless:true,args:['--use-angle=swiftshader','--enable-unsafe-swiftshader']});const checks=[],errors=[],writes=[];const check=(name,ok)=>{assert(ok,name);checks.push({name,pass:true});};let mode='',activeWrites=0,maxWrites=0;const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 try{const c=await browser.newContext({viewport:{width:600,height:600}});await route(c,{handle:async(r,u)=>{

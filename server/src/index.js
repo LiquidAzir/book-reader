@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 
 const { attachUser } = require('./middleware/device');
+const { readLimiter, writeLimiter } = require('./middleware/rateLimit');
 const booksRoutes = require('./routes/books');
 const meRoutes = require('./routes/me');
 
@@ -23,10 +24,12 @@ app.get('/api/health', (req, res) => {
   res.set('Cache-Control', 'no-store').json({ ok: true, time: Date.now(), build: process.env.RENDER_GIT_COMMIT || 'local' });
 });
 
+// Health stays unlimited so Render's checks never trip it; everything else under /api is per-IP limited.
+app.use('/api', (req, res, next) => (req.path === '/health' ? next() : readLimiter(req, res, next)));
 app.use('/api', booksRoutes);
 app.use('/api/me', (req, res, next) => {
   res.set('Cache-Control', 'private, no-store'); res.vary('X-Device-Id'); next();
-}, attachUser, meRoutes);
+}, (req, res, next) => (req.method === 'GET' ? next() : writeLimiter(req, res, next)), attachUser, meRoutes);
 
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 
